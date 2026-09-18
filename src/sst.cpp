@@ -4,6 +4,9 @@
 #include "log.h"
 #include "util.h"
 #include <cassert>
+#include <cerrno>
+#include <cstring>
+#include <stdexcept>
 #include <utility>
 
 bool SSTBuilder::flush_block(bool with_crc) {
@@ -69,7 +72,12 @@ std::shared_ptr<SST> SSTBuilder::build(std::uint64_t sst_id,
 					  meta_offset_bytes.end());
 	write_data.push_back(MAGIC_NUM); // write_data构造完成
 
-	FileObj file = FileObj::create_and_write(path, write_data);
+	FileObj::atomic_write(path, write_data);
+	FileObj file = FileObj::open_rw(path);
+	if (!file.is_valid()) {
+		throw std::runtime_error("file " + path +
+								 " open failed, errno: " + strerror(errno));
+	}
 	std::string first_key = _block_metas[0]._first_key;
 	std::string last_key = _block_metas[_block_metas.size() - 1]._last_key;
 	return std::make_shared<SST>(std::move(file), _block_metas,

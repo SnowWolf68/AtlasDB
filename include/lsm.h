@@ -4,8 +4,10 @@
 #include "MemTable.h"
 #include "Record.h"
 #include "sst.h"
+#include "wal.h"
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
@@ -23,11 +25,14 @@ class LSM;
 
 class LSMEngine : public std::enable_shared_from_this<LSMEngine> {
 	inline static const std::string DEFAULT_COM_SEQ_FILENAME = "seq.txt";
+	inline static const std::string DEFAULT_MANIFEST_FILENAME = "manifest.txt";
+
 
 	friend LSMEngineIterator;
 	static const std::size_t DEFAULT_MAX_MEMTABLE_SIZE = 64 * 1024 * 1024;
 	static const std::size_t DEFAULT_COMPACT_THRESHOLD = 4;
 	static const std::size_t DEFAULT_L0_SST_SIZE = 4 * 1024 * 1024;
+	static const std::size_t MAX_KEY_LEN = 65535 - 8;
 
 public:
 	LSMEngine(const std::string &data_dir,
@@ -53,19 +58,20 @@ public:
 									 std::uint64_t commit_sequence);
 	std::optional<std::uint64_t> remove(const std::string &key,
 										std::uint64_t commit_sequence);
-	std::optional<std::uint64_t>
+	std::vector<std::optional<std::uint64_t>>
 	put_batch(std::vector<std::pair<std::string, std::string>> kvs,
 			  std::vector<std::uint64_t> commit_sequences);
-	std::optional<std::uint64_t>
+	std::vector<std::optional<std::uint64_t>>
 	remove_batch(std::vector<std::string> ks,
 				 std::vector<std::uint64_t> commit_sequences);
 
 	std::optional<std::uint64_t> put(const std::string &key,
 									 const std::string &value);
 	std::optional<std::uint64_t> remove(const std::string &key);
-	std::optional<std::uint64_t>
+	std::vector<std::optional<std::uint64_t>>
 	put_batch(std::vector<std::pair<std::string, std::string>> kvs);
-	std::optional<std::uint64_t> remove_batch(std::vector<std::string> ks);
+	std::vector<std::optional<std::uint64_t>>
+	remove_batch(std::vector<std::string> ks);
 
 	/**
 	-- param:
@@ -130,9 +136,23 @@ public:
 private:
 	LookUpResult get_from_sst_without_lock(const std::string &user_key,
 										   std::uint64_t commit_sequence);
-	bool delete_level(std::size_t level);
-	void insert_level(std::size_t target_level,
-					  std::vector<std::shared_ptr<SST>> ssts);
+	void delete_level(std::size_t level, std::deque<std::size_t> ids);
+	std::deque<std::size_t>
+	insert_level(std::size_t target_level,
+				 std::vector<std::shared_ptr<SST>> ssts);
+	std::optional<std::uint64_t> apply_insert(const std::string &key,
+											  const std::string &value,
+											  std::uint64_t commit_sequence,
+											  ValueType value_type);
+	void renew_manifest(const std::string &manifest_path);
+	static std::vector<std::uint8_t>
+	encode_sst_info(std::pair<std::size_t, std::size_t> sst_info);
+
+	void renew_manifest_without_delete_with_insert(std::size_t level1,
+												   std::size_t level2,
+												   std::deque<std::size_t> ids);
+
+	static bool is_all_digit(const std::string &str);
 
 	std::string _data_dir;
 	MemTable _memtable;
@@ -148,6 +168,9 @@ private:
 	std::atomic_uint64_t _commit_sequence;
 	std::shared_mutex _close_mutex;
 	std::string _com_seq_filepath;
+	WAL _wal;
+	std::mutex _wal_write_mutex;
+	bool _wal_error;
 };
 
 class ConcatIterator : public BaseIterator {
@@ -240,9 +263,10 @@ public:
 	std::optional<std::uint64_t> put(const std::string &key,
 									 const std::string &value);
 	std::optional<std::uint64_t> remove(const std::string &key);
-	std::optional<std::uint64_t>
+	std::vector<std::optional<std::uint64_t>>
 	put_batch(std::vector<std::pair<std::string, std::string>> kvs);
-	std::optional<std::uint64_t> remove_batch(std::vector<std::string> ks);
+	std::vector<std::optional<std::uint64_t>>
+	remove_batch(std::vector<std::string> ks);
 	LookUpResult get(const std::string &key);
 	std::vector<LookUpResult> get_batch(const std::vector<std::string> &keys);
 	HeapIterator range(const std::string &start_user_key,

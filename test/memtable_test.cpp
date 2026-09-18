@@ -60,7 +60,7 @@ void test_empty_memtable_get() {
 
 void test_put_and_get() {
 	MemTable table;
-	CHECK(table.put("alpha", "hello", 10));
+	CHECK(table.put("alpha", "hello", 10)._is_add);
 
 	auto result = table.get("alpha", 10);
 	check_result_is_value(result, "hello", 10);
@@ -71,9 +71,9 @@ void test_put_and_get() {
 
 void test_put_multiple_keys() {
 	MemTable table;
-	CHECK(table.put("alpha", "1", 10));
-	CHECK(table.put("bravo", "2", 20));
-	CHECK(table.put("charlie", "3", 30));
+	CHECK(table.put("alpha", "1", 10)._is_add);
+	CHECK(table.put("bravo", "2", 20)._is_add);
+	CHECK(table.put("charlie", "3", 30)._is_add);
 
 	check_result_is_value(table.get("alpha", 100), "1", 10);
 	check_result_is_value(table.get("bravo", 100), "2", 20);
@@ -83,9 +83,9 @@ void test_put_multiple_keys() {
 
 void test_put_same_key_different_sequence() {
 	MemTable table;
-	CHECK(table.put("alpha", "first", 10));
-	CHECK(table.put("alpha", "second", 20));
-	CHECK(table.put("alpha", "third", 30));
+	CHECK(table.put("alpha", "first", 10)._is_add);
+	CHECK(table.put("alpha", "second", 20)._is_add);
+	CHECK(table.put("alpha", "third", 30)._is_add);
 
 	// get with seq=50 should see the latest version (seq=30)
 	check_result_is_value(table.get("alpha", 50), "third", 30);
@@ -97,8 +97,8 @@ void test_put_same_key_different_sequence() {
 
 void test_remove_and_get() {
 	MemTable table;
-	CHECK(table.put("alpha", "hello", 10));
-	CHECK(table.remove("alpha", 20));
+	CHECK(table.put("alpha", "hello", 10)._is_add);
+	CHECK(table.remove("alpha", 20)._is_success);
 
 	// get with seq=30 should see the tombstone
 	check_result_is_tombstone(table.get("alpha", 30), 20);
@@ -109,13 +109,13 @@ void test_remove_and_get() {
 void test_tombstone_not_confused_with_empty_value() {
 	MemTable table;
 	// empty value is a legitimate value
-	CHECK(table.put("alpha", "", 10));
+	CHECK(table.put("alpha", "", 10)._is_add);
 
 	auto result = table.get("alpha", 10);
 	check_result_is_value(result, "", 10);
 
 	// remove the key
-	CHECK(table.remove("alpha", 20));
+	CHECK(table.remove("alpha", 20)._is_success);
 
 	result = table.get("alpha", 100);
 	check_result_is_tombstone(result, 20);
@@ -125,12 +125,12 @@ void test_tombstone_not_confused_with_empty_value() {
 
 void test_empty_key() {
 	MemTable table;
-	CHECK(table.put("", "empty-key-value", 10));
+	CHECK(table.put("", "empty-key-value", 10)._is_add);
 
 	auto result = table.get("", 10);
 	check_result_is_value(result, "empty-key-value", 10);
 
-	CHECK(table.remove("", 20));
+	CHECK(table.remove("", 20)._is_success);
 	check_result_is_tombstone(table.get("", 100), 20);
 }
 
@@ -139,7 +139,7 @@ void test_binary_key_and_value() {
 	const std::string binary_key("a\0b\xff", 4);
 	const std::string binary_value("\x00hello\xff", 7);
 
-	CHECK(table.put(binary_key, binary_value, 10));
+	CHECK(table.put(binary_key, binary_value, 10)._is_add);
 
 	auto result = table.get(binary_key, 100);
 	check_result_is_value(result, binary_value, 10);
@@ -147,7 +147,7 @@ void test_binary_key_and_value() {
 
 void test_get_nonexistent_key() {
 	MemTable table;
-	CHECK(table.put("alpha", "1", 10));
+	CHECK(table.put("alpha", "1", 10)._is_add);
 
 	check_result_is_notfound(table.get("bravo", 10));
 	check_result_is_notfound(table.get("ALPHA", 10));
@@ -167,7 +167,7 @@ void test_freeze_triggers_and_data_persists() {
 	for (int i = 0; i < 10; i++) {
 		std::string key = "key-" + std::to_string(i);
 		std::string value = "value-" + std::to_string(i);
-		CHECK(table.put(key, value, static_cast<std::uint64_t>(i + 1)));
+		CHECK(table.put(key, value, static_cast<std::uint64_t>(i + 1))._is_add);
 	}
 
 	// Data written before freeze should still be accessible
@@ -183,14 +183,14 @@ void test_freeze_then_put_new_data() {
 				   std::make_shared<InternalKeyComparator>());
 
 	// Phase 1: trigger freeze
-	CHECK(table.put("foo", "old", 10));
+	CHECK(table.put("foo", "old", 10)._is_add);
 	for (int i = 0; i < 10; i++) {
 		table.put("bulk-" + std::to_string(i),
-				  "padding-data-that-takes-space", 20);
+				  "padding-data-that-takes-space", 20)._is_add;
 	}
 
 	// Phase 2: after freeze, write fresh data to new active table
-	CHECK(table.put("foo", "new", 30));
+	CHECK(table.put("foo", "new", 30)._is_add);
 
 	// get with large seq should see the newest version (active)
 	check_result_is_value(table.get("foo", 100), "new", 30);
@@ -204,14 +204,14 @@ void test_freeze_then_remove() {
 				   std::make_shared<InternalKeyComparator>());
 
 	// Phase 1: insert and trigger freeze
-	CHECK(table.put("foo", "old-value", 10));
+	CHECK(table.put("foo", "old-value", 10)._is_add);
 	for (int i = 0; i < 10; i++) {
 		table.put("bulk-" + std::to_string(i),
-				  "padding-data-that-takes-space", 20);
+				  "padding-data-that-takes-space", 20)._is_add;
 	}
 
 	// Phase 2: remove in new active table
-	CHECK(table.remove("foo", 30));
+	CHECK(table.remove("foo", 30)._is_success);
 
 	// Get with large seq should see tombstone (from active)
 	check_result_is_tombstone(table.get("foo", 100), 30);
@@ -239,8 +239,8 @@ void test_put_batch_and_get_batch() {
 
 void test_get_batch_mixed_found_and_notfound() {
 	MemTable table;
-	CHECK(table.put("exists1", "a", 10));
-	CHECK(table.put("exists2", "b", 20));
+	CHECK(table.put("exists1", "a", 10)._is_add);
+	CHECK(table.put("exists2", "b", 20)._is_add);
 
 	std::vector<std::string> keys = {"exists1", "missing", "exists2"};
 	auto results = table.get_batch(keys, {100, 100, 100});
@@ -252,9 +252,9 @@ void test_get_batch_mixed_found_and_notfound() {
 
 void test_remove_batch() {
 	MemTable table;
-	CHECK(table.put("k1", "v1", 10));
-	CHECK(table.put("k2", "v2", 20));
-	CHECK(table.put("k3", "v3", 30));
+	CHECK(table.put("k1", "v1", 10)._is_add);
+	CHECK(table.put("k2", "v2", 20)._is_add);
+	CHECK(table.put("k3", "v3", 30)._is_add);
 
 	CHECK(table.remove_batch({"k1", "k3"}, {40, 50}));
 
@@ -269,14 +269,14 @@ void test_get_batch_across_active_and_frozen() {
 				   std::make_shared<InternalKeyComparator>());
 
 	// Phase 1: write and trigger freeze
-	CHECK(table.put("frozen-key", "frozen-value", 10));
+	CHECK(table.put("frozen-key", "frozen-value", 10)._is_add);
 	for (int i = 0; i < 10; i++) {
 		table.put("bulk-" + std::to_string(i),
-				  "padding-data-that-takes-space", 20);
+				  "padding-data-that-takes-space", 20)._is_add;
 	}
 
 	// Phase 2: write new data to active
-	CHECK(table.put("active-key", "active-value", 30));
+	CHECK(table.put("active-key", "active-value", 30)._is_add);
 
 	// Batch get both keys
 	std::vector<std::string> keys = {"frozen-key", "active-key", "missing"};
@@ -291,10 +291,10 @@ void test_get_batch_across_active_and_frozen() {
 
 void test_prefix_basic() {
 	MemTable table;
-	CHECK(table.put("apple", "1", 10));
-	CHECK(table.put("application", "2", 20));
-	CHECK(table.put("banana", "3", 30));
-	CHECK(table.put("apricot", "4", 40));
+	CHECK(table.put("apple", "1", 10)._is_add);
+	CHECK(table.put("application", "2", 20)._is_add);
+	CHECK(table.put("banana", "3", 30)._is_add);
+	CHECK(table.put("apricot", "4", 40)._is_add);
 
 	// prefix "app" should match "apple" and "application"
 	auto it = table.begin_preffix("app", 100);
@@ -314,8 +314,8 @@ void test_prefix_basic() {
 
 void test_prefix_no_match() {
 	MemTable table;
-	CHECK(table.put("apple", "1", 10));
-	CHECK(table.put("banana", "2", 20));
+	CHECK(table.put("apple", "1", 10)._is_add);
+	CHECK(table.put("banana", "2", 20)._is_add);
 
 	// prefix "z" should return empty iterator
 	auto it = table.begin_preffix("z", 100);
@@ -327,17 +327,17 @@ void test_prefix_with_frozen() {
 	MemTable table(tiny, std::make_shared<InternalKeyComparator>());
 
 	// Phase 1: frozen data
-	CHECK(table.put("alpha", "frozen-alpha", 10));
-	CHECK(table.put("beta", "frozen-beta", 20));
+	CHECK(table.put("alpha", "frozen-alpha", 10)._is_add);
+	CHECK(table.put("beta", "frozen-beta", 20)._is_add);
 	// Force freeze by bulk writes
 	for (int i = 0; i < 10; i++) {
 		table.put("bulk-" + std::to_string(i),
-				  "padding-data-that-takes-space", 30);
+				  "padding-data-that-takes-space", 30)._is_add;
 	}
 
 	// Phase 2: active data
-	CHECK(table.put("alpha", "active-alpha", 40));
-	CHECK(table.put("gamma", "active-gamma", 50));
+	CHECK(table.put("alpha", "active-alpha", 40)._is_add);
+	CHECK(table.put("gamma", "active-gamma", 50)._is_add);
 
 	// prefix "a" - active "alpha"(seq=40) should shadow frozen "alpha"(seq=10)
 	auto it = table.begin_preffix("a", 100);
@@ -351,12 +351,12 @@ void test_prefix_tombstone_skip() {
 	MemTable table(tiny, std::make_shared<InternalKeyComparator>());
 
 	// Frozen: put then delete
-	CHECK(table.put("alpha", "value", 10));
+	CHECK(table.put("alpha", "value", 10)._is_add);
 	for (int i = 0; i < 10; i++) {
 		table.put("bulk-" + std::to_string(i),
-				  "padding-data-that-takes-space", 30);
+				  "padding-data-that-takes-space", 30)._is_add;
 	}
-	CHECK(table.remove("alpha", 20));
+	CHECK(table.remove("alpha", 20)._is_success);
 
 	// prefix "a" - TombStone should be skipped
 	auto it = table.begin_preffix("a", 100);
@@ -365,8 +365,8 @@ void test_prefix_tombstone_skip() {
 
 void test_prefix_empty_prefix() {
 	MemTable table;
-	CHECK(table.put("a", "1", 10));
-	CHECK(table.put("b", "2", 20));
+	CHECK(table.put("a", "1", 10)._is_add);
+	CHECK(table.put("b", "2", 20)._is_add);
 
 	// empty prefix → all keys
 	auto it = table.begin_preffix("", 100);
@@ -384,10 +384,10 @@ void test_prefix_empty_prefix() {
 
 void test_monotony_predicate_basic() {
 	MemTable table;
-	CHECK(table.put("alpha", "1", 10));
-	CHECK(table.put("bravo", "2", 20));
-	CHECK(table.put("charlie", "3", 30));
-	CHECK(table.put("delta", "4", 40));
+	CHECK(table.put("alpha", "1", 10)._is_add);
+	CHECK(table.put("bravo", "2", 20)._is_add);
+	CHECK(table.put("charlie", "3", 30)._is_add);
+	CHECK(table.put("delta", "4", 40)._is_add);
 
 	// predicate: "bravo" <= key < "delta"
 	auto pred = [](const std::string &key) -> int {
@@ -411,8 +411,8 @@ void test_monotony_predicate_basic() {
 
 void test_monotony_predicate_no_match() {
 	MemTable table;
-	CHECK(table.put("alpha", "1", 10));
-	CHECK(table.put("bravo", "2", 20));
+	CHECK(table.put("alpha", "1", 10)._is_add);
+	CHECK(table.put("bravo", "2", 20)._is_add);
 
 	// predicate: key >= "z"
 	auto pred = [](const std::string &key) -> int {
@@ -428,9 +428,9 @@ void test_monotony_predicate_no_match() {
 
 void test_monotony_predicate_commit_sequence_filter() {
 	MemTable table;
-	CHECK(table.put("alpha", "visible", 10));
-	CHECK(table.put("alpha", "hidden", 100));
-	CHECK(table.put("bravo", "visible", 20));
+	CHECK(table.put("alpha", "visible", 10)._is_add);
+	CHECK(table.put("alpha", "hidden", 100)._is_add);
+	CHECK(table.put("bravo", "visible", 20)._is_add);
 
 	// predicate: all keys
 	auto pred = [](const std::string &key) -> int { return 0; };
@@ -453,8 +453,8 @@ void test_monotony_predicate_commit_sequence_filter() {
 
 void test_monotony_predicate_all_visible_with_max_seq() {
 	MemTable table;
-	CHECK(table.put("alpha", "val1", 10));
-	CHECK(table.put("bravo", "val2", 20));
+	CHECK(table.put("alpha", "val1", 10)._is_add);
+	CHECK(table.put("bravo", "val2", 20)._is_add);
 
 	auto pred = [](const std::string &key) -> int { return 0; };
 
@@ -474,14 +474,14 @@ void test_monotony_predicate_with_frozen() {
 	MemTable table(tiny, std::make_shared<InternalKeyComparator>());
 
 	// frozen data
-	CHECK(table.put("alpha", "frozen", 10));
+	CHECK(table.put("alpha", "frozen", 10)._is_add);
 	for (int i = 0; i < 10; i++) {
 		table.put("bulk-" + std::to_string(i),
-				  "padding-data-that-takes-space", 30);
+				  "padding-data-that-takes-space", 30)._is_add;
 	}
 
 	// active data
-	CHECK(table.put("alpha", "active", 50));
+	CHECK(table.put("alpha", "active", 50)._is_add);
 
 	auto pred = [](const std::string &key) -> int { return 0; };
 	// seq=40: frozen alpha(10) visible, active alpha(50) NOT visible
@@ -503,14 +503,14 @@ void test_get_total_size_tracks_puts_and_remove() {
 	MemTable table;
 
 	// each entry counts key + value + 8 (seq + value type)
-	CHECK(table.put("alpha", "hello", 10)); // 5 + 5 + 8 = 18
+	CHECK(table.put("alpha", "hello", 10)._is_add); // 5 + 5 + 8 = 18
 	CHECK(table.get_total_size() == 18);
 
-	CHECK(table.put("beta", "x", 20)); // 4 + 1 + 8 = 13
+	CHECK(table.put("beta", "x", 20)._is_add); // 4 + 1 + 8 = 13
 	CHECK(table.get_total_size() == 31);
 
 	// remove stores a tombstone entry: key + empty + 8
-	CHECK(table.remove("beta", 30)); // 4 + 0 + 8 = 12
+	CHECK(table.remove("beta", 30)._is_success); // 4 + 0 + 8 = 12
 	CHECK(table.get_total_size() == 43);
 }
 
@@ -541,7 +541,7 @@ void test_get_total_size_across_freeze_and_flush() {
 	std::string sst_path = "/tmp/atlasdb_memtable_test_freeze.sst";
 	std::vector<std::uint64_t> flushed_seqs;
 	std::shared_ptr<SST> sst =
-		table.flush_last(builder, sst_path, 1, flushed_seqs);
+		table.flush_last(builder, sst_path, 1, flushed_seqs)._sst;
 	CHECK(sst != nullptr);
 	// frozen part was > 4MB; only the post-freeze tail remains
 	CHECK(table.get_total_size() <
@@ -553,8 +553,8 @@ void test_get_total_size_across_freeze_and_flush() {
 
 void test_clear_resets_active_data() {
 	MemTable table;
-	CHECK(table.put("alpha", "hello", 10));
-	CHECK(table.put("bravo", "world", 20));
+	CHECK(table.put("alpha", "hello", 10)._is_add);
+	CHECK(table.put("bravo", "world", 20)._is_add);
 	CHECK(table.get_total_size() > 0);
 
 	table.clear();
@@ -564,7 +564,7 @@ void test_clear_resets_active_data() {
 	check_result_is_notfound(table.get("bravo", 100));
 
 	// the table stays usable after clear
-	CHECK(table.put("charlie", "again", 30));
+	CHECK(table.put("charlie", "again", 30)._is_add);
 	check_result_is_value(table.get("charlie", 100), "again", 30);
 	CHECK(table.get_total_size() == 7 + 5 + 8); // "charlie" + "again" + 8
 }
@@ -594,11 +594,11 @@ void test_clear_with_frozen_tables() {
 	std::string sst_path = "/tmp/atlasdb_memtable_test_clear.sst";
 	std::vector<std::uint64_t> flushed_seqs;
 	std::shared_ptr<SST> sst =
-		table.flush_last(builder, sst_path, 1, flushed_seqs);
+		table.flush_last(builder, sst_path, 1, flushed_seqs)._sst;
 	CHECK(sst == nullptr);
 
 	// still usable after clearing a frozen table
-	CHECK(table.put("alpha", "hello", 10));
+	CHECK(table.put("alpha", "hello", 10)._is_add);
 	check_result_is_value(table.get("alpha", 100), "hello", 10);
 }
 

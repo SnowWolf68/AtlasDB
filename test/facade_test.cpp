@@ -205,7 +205,12 @@ void test_close_semantics() {
 		db.close();
 		// close 后:写优雅拒绝(nullopt,不是崩溃)
 		CHECK(!db.put("k2", "v2").has_value());
-		CHECK(!db.put_batch({{"a", "1"}}).has_value());
+		auto put_results = db.put_batch({{"a", "1"}, {"b", "2"}});
+		CHECK(put_results.size() == 2);
+		CHECK(!put_results[0] && !put_results[1]);
+		auto remove_results = db.remove_batch({"k", "missing"});
+		CHECK(remove_results.size() == 2);
+		CHECK(!remove_results[0] && !remove_results[1]);
 		CHECK(!db.remove("k").has_value());
 		// 读照常(数据已落盘)
 		auto res = db.get("k");

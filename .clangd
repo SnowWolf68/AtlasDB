@@ -1,0 +1,5 @@
+CompileFlags:
+  CompilationDatabase: build/dev
+  # GCC 11 defaults to C++17, so CMake may omit -std from the database.
+  # clangd must use the same language standard explicitly.
+  Add: [-std=c++17]

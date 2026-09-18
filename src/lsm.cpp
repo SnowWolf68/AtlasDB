@@ -4,15 +4,22 @@
 #include "Comparator.h"
 #include "MemTable.h"
 #include "Record.h"
+#include "log.h"
 #include "sst.h"
 #include "util.h"
 #include <algorithm>
+#include <bits/types/FILE.h>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <deque>
 #include <exception>
+#include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -21,7 +28,14 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
+
 
 LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 					 std::size_t max_active_size, std::size_t compact_threshold,
@@ -29,10 +43,68 @@ LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 	: _data_dir(data_dir), _memtable(max_active_size), _next_sst_id(0),
 	  _cur_max_level(0), _max_memtable_size(max_memtable_size),
 	  _compact_threshold(compact_threshold), _max_l0_sst_size(max_l0_sst_size),
-	  _close(false) {
+	  _close(false), _wal_error(false) {
 	std::filesystem::create_directories(_data_dir);
+
+	std::unordered_map<std::size_t, std::size_t> sst_infos;
+	// manifest相关
+	std::string manifest_filepath = _data_dir + "/" + DEFAULT_MANIFEST_FILENAME;
+	if (!std::filesystem::exists(manifest_filepath)) {
+		FileObj manifest_file = FileObj::create_rw(manifest_filepath);
+		// 把磁盘上的sst文件恢复到manifest中
+		std::vector<std::uint8_t> manifest_data;
+		for (auto item : std::filesystem::directory_iterator(_data_dir)) {
+			if (item.is_regular_file()) {
+				std::optional<std::pair<std::size_t, std::size_t>> sst_info =
+					decode_sst_path(
+						item.path()); // std::filesystem::path可以隐式类型转换到std::string
+				if (sst_info == std::nullopt) {
+					// 解析有问题, 文件名有错误, 跳过, 继续解析下一个文件
+					continue;
+				}
+				sst_infos.insert(
+					{sst_info.value().first, sst_info.value().second});
+				std::vector<std::uint8_t> sst_info_bytes =
+					encode_sst_info(sst_info.value());
+				manifest_data.insert(manifest_data.end(),
+									 sst_info_bytes.begin(),
+									 sst_info_bytes.end());
+				manifest_data.push_back('\n');
+			}
+		}
+		FileObj::atomic_write(manifest_filepath, manifest_data);
+	}
+
+	// 读manifest, 找到所有需要恢复的<sst_id, level>集合
+	if (sst_infos.empty()) {
+		FileObj manifest_file(manifest_filepath);
+		std::fstream fs(manifest_filepath);
+		std::string line;
+		std::getline(fs, line);
+		while (fs) {
+			std::size_t pos = line.find(",");
+			if (pos == std::string::npos) {
+				// 当前这一行格式有问题, 解析错误
+				throw std::runtime_error(
+					"manifest file parse error, format error");
+			}
+			std::string id_str = line.substr(0, pos),
+						level_str = line.substr(pos + 1);
+			if (!is_all_digit(id_str) || !is_all_digit(level_str)) {
+				// 当前这一行格式有问题, 解析错误
+				throw std::runtime_error(
+					"manifest file parse error, format error");
+			}
+			std::size_t id = std::stoull(id_str),
+						level = std::stoull(level_str);
+			sst_infos.insert({id, level});
+			std::getline(fs, line);
+		}
+	}
+
 	// 扫描data_dir中的文件, 将数据恢复到sst中
 	bool found = false;
+	std::size_t cnt = 0;
 	for (auto item : std::filesystem::directory_iterator(_data_dir)) {
 		if (item.is_regular_file()) {
 			std::optional<std::pair<std::size_t, std::size_t>> sst_info =
@@ -43,15 +115,22 @@ LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 				continue;
 			}
 			std::size_t sst_id = sst_info->first, level = sst_info->second;
-			std::shared_ptr<SST> sst = SST::open(item.path(), sst_id);
-			if (sst == nullptr) { continue; }
-			std::unique_lock<std::shared_mutex> unique(_ssts_mutex);
-			_sst_id_map[level].push_back(sst_id);
-			_ssts[sst_id] = sst;
-			_cur_max_level = std::max(_cur_max_level, level);
-			_next_sst_id = std::max(_next_sst_id, sst_id);
-			found = true;
+			auto find = sst_infos.find(sst_id);
+			if (find != sst_infos.end() && find->second == level) {
+				std::shared_ptr<SST> sst = SST::open(item.path(), sst_id);
+				if (sst == nullptr) { continue; }
+				std::unique_lock<std::shared_mutex> unique(_ssts_mutex);
+				_sst_id_map[level].push_back(sst_id);
+				_ssts[sst_id] = sst;
+				_cur_max_level = std::max(_cur_max_level, level);
+				_next_sst_id = std::max(_next_sst_id, sst_id);
+				found = true;
+				cnt++;
+			}
 		}
+	}
+	if (cnt != sst_infos.size()) {
+		throw std::runtime_error("sst file missing");
 	}
 	std::unique_lock<std::shared_mutex> unique(_ssts_mutex);
 	if (found) { _next_sst_id++; }
@@ -64,17 +143,38 @@ LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 					  [](std::size_t a, std::size_t b) { return a < b; });
 		}
 	}
+	std::uint64_t wal_max_commit_sequence = _wal.load_wal(_data_dir, _memtable);
 	_com_seq_filepath = _data_dir + "/" + DEFAULT_COM_SEQ_FILENAME;
 	if (std::filesystem::exists(_com_seq_filepath)) {
 		FileObj seq_file = FileObj::open_read(_com_seq_filepath);
 		std::uint64_t commit_sequence = seq_file.read_uint64(0);
+		commit_sequence =
+			std::max(commit_sequence, wal_max_commit_sequence + 1);
 		_commit_sequence.store(commit_sequence);
 	} else {
 		std::uint64_t init_seq = 1;
 		std::vector<std::uint8_t> data = get_bytes_of_uint64t(init_seq);
-		FileObj seq_file = FileObj::create_and_write(_com_seq_filepath, data);
-		_commit_sequence.store(1);
+		FileObj::atomic_write(_com_seq_filepath, data);
+		_commit_sequence.store(std::max(1UL, wal_max_commit_sequence + 1));
 	}
+}
+
+bool LSMEngine::is_all_digit(const std::string &str) {
+	for (char ch : str) {
+		if (!(ch >= '0' && ch <= '9')) { return false; }
+	}
+	return true;
+}
+
+std::vector<std::uint8_t>
+LSMEngine::encode_sst_info(std::pair<std::size_t, std::size_t> sst_info) {
+	std::vector<std::uint8_t> id_bytes = get_bytes_of_uint64t(sst_info.first);
+	std::vector<std::uint8_t> data(id_bytes);
+	std::vector<std::uint8_t> level_bytes =
+		get_bytes_of_uint64t(sst_info.second);
+	data.push_back(',');
+	data.insert(data.end(), level_bytes.begin(), level_bytes.end());
+	return data;
 }
 
 std::string LSMEngine::get_sst_path(std::size_t id, std::size_t level) {
@@ -91,6 +191,7 @@ std::optional<std::pair<std::size_t, std::size_t>>
 LSMEngine::decode_sst_path(const std::string &path_str) {
 	std::filesystem::path path = path_str;
 	std::string filename = path.filename();
+	if (filename.find(".tmp") != std::string::npos) { return std::nullopt; }
 	std::size_t find_pos = filename.find(".");
 	if (find_pos == std::string::npos) { return std::nullopt; }
 	try {
@@ -102,6 +203,18 @@ LSMEngine::decode_sst_path(const std::string &path_str) {
 	} catch (const std::exception &e) { return std::nullopt; }
 }
 
+void LSMEngine::renew_manifest(const std::string &manifest_path) {
+	std::vector<std::uint8_t> data;
+	for (const auto &[level, ids] : _sst_id_map) {
+		for (std::size_t id : ids) {
+			std::string str =
+				std::to_string(id) + "," + std::to_string(level) + "\n";
+			data.insert(data.end(), str.begin(), str.end());
+		}
+	}
+	FileObj::atomic_write(manifest_path, data);
+}
+
 /**
 把 MemTable 中最老的一张表（frozen 队首）刷成磁盘上的一个 SST 文件，
 并把新 SST 登记进引擎索引
@@ -109,21 +222,52 @@ LSMEngine::decode_sst_path(const std::string &path_str) {
 		max_commit_sequence: 本次刷出的 SST 里最大 seq
 */
 std::uint64_t LSMEngine::flush() {
-	std::vector<std::uint8_t> data =
-		get_bytes_of_uint64t(_commit_sequence.load());
-	FileObj::create_and_write(_com_seq_filepath, data);
-
 	SSTBuilder builder;
 	std::vector<std::uint64_t> flushed_seqs;
 	std::size_t cur_sst_id;
 	std::unique_lock<std::shared_mutex> unique(_ssts_mutex);
+	std::lock_guard<std::mutex> wal_write_mutex(_wal_write_mutex);
+
+	std::vector<std::uint8_t> data =
+		get_bytes_of_uint64t(_commit_sequence.load());
+	// FileObj::create_and_write(_com_seq_filepath, data);
+	FileObj::atomic_write(_com_seq_filepath, data);
+
 	cur_sst_id = _next_sst_id;
 	_next_sst_id++;
-	std::shared_ptr<SST> sst = _memtable.flush_last(
+	MemTable::FlushLastResult flush_res = _memtable.flush_last(
 		builder, get_sst_path(cur_sst_id, 0), cur_sst_id, flushed_seqs);
+	std::shared_ptr<SST> sst = flush_res._sst;
 	if (sst == nullptr) { return 0; }
 	_sst_id_map[0].push_front(cur_sst_id);
 	_ssts[cur_sst_id] = sst;
+
+	// 直接整体覆盖manifest文件
+	std::string manifest_filepath = _data_dir + "/" + DEFAULT_MANIFEST_FILENAME;
+	renew_manifest(manifest_filepath);
+
+	// 删除对应的wal文件
+	try {
+		bool del_res =
+			WAL::delete_wal_by_id(_data_dir, flush_res._flush_id.value());
+		if (!del_res) {
+			LOG(Log::LogLevel::ERROR)
+				<< "delete wal file: " +
+					   WAL::get_filepath(_data_dir,
+										 flush_res._flush_id.value()) +
+					   " failed";
+		}
+	} catch (const std::exception &e) {
+		LOG(Log::LogLevel::ERROR)
+			<< "delete wal file: " +
+				   WAL::get_filepath(_data_dir, flush_res._flush_id.value()) +
+				   " failed, e: " + e.what();
+	}
+	if (flush_res._new_active_id != std::nullopt) {
+		try {
+			_wal = WAL(_data_dir, flush_res._new_active_id.value());
+		} catch (const std::exception &e) { _wal_error = true; }
+	}
 	std::uint64_t max_commit_sequence = 0;
 	for (auto x : flushed_seqs) {
 		max_commit_sequence = std::max(max_commit_sequence, x);
@@ -141,12 +285,56 @@ std::uint64_t LSMEngine::flush() {
 std::optional<std::uint64_t> LSMEngine::put(const std::string &key,
 											const std::string &value,
 											std::uint64_t commit_sequence) {
+	// return apply_insert(key, value, commit_sequence, ValueType::Value);
+	std::optional<std::uint64_t> res = std::nullopt;
 	{
+		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
 		std::shared_lock<std::shared_mutex> shared(_close_mutex);
-		if (_close) { return std::nullopt; }
-		_memtable.put(key, value, commit_sequence);
+		res = apply_insert(key, value, commit_sequence, ValueType::Value);
 	}
 	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
+	return res;
+}
+
+std::optional<std::uint64_t>
+LSMEngine::apply_insert(const std::string &key, const std::string &value,
+						std::uint64_t commit_sequence, ValueType value_type) {
+	if (key.size() > MAX_KEY_LEN) { return std::nullopt; }
+	{
+		if (_wal_error) { return std::nullopt; }
+		if (_close) { return std::nullopt; }
+		bool wal_res = _wal.append(
+			InternalKey::encode(InternalKey(key, commit_sequence, value_type)),
+			value);
+		if (!wal_res) {
+			_wal_error = true;
+			return std::nullopt;
+		}
+		std::optional<std::uint64_t> frozen_list_id = std::nullopt,
+									 new_active_id = std::nullopt;
+		if (value_type == ValueType::Value) {
+			// put
+			MemTable::PutResult put_res =
+				_memtable.put(key, value, commit_sequence);
+			frozen_list_id = put_res._frozen_list_id;
+			new_active_id = put_res._new_active_list_id;
+		} else {
+			// remove
+			MemTable::RemoveResult remove_res =
+				_memtable.remove(key, commit_sequence);
+			frozen_list_id = remove_res._frozen_list_id;
+			new_active_id = remove_res._new_active_list_id;
+		}
+
+		if (frozen_list_id != std::nullopt) {
+			// 发生了froze
+			_wal.fsync();
+			_wal.close();
+			try {
+				_wal = WAL(_data_dir, new_active_id.value());
+			} catch (const std::exception &e) { _wal_error = true; }
+		}
+	}
 	return commit_sequence;
 }
 
@@ -158,13 +346,15 @@ std::optional<std::uint64_t> LSMEngine::put(const std::string &key,
 */
 std::optional<std::uint64_t> LSMEngine::remove(const std::string &key,
 											   std::uint64_t commit_sequence) {
+	// return apply_insert(key, "", commit_sequence, ValueType::TombStone);
+	std::optional<std::uint64_t> res = std::nullopt;
 	{
+		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
 		std::shared_lock<std::shared_mutex> shared(_close_mutex);
-		if (_close) { return std::nullopt; }
-		_memtable.remove(key, commit_sequence);
+		res = apply_insert(key, "", commit_sequence, ValueType::TombStone);
 	}
 	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
-	return commit_sequence;
+	return res;
 }
 
 /**
@@ -173,21 +363,27 @@ std::optional<std::uint64_t> LSMEngine::remove(const std::string &key,
 		nullopt = 引擎已关闭拒绝
 		max_commit_sequence: 本次写的 seq / 整批 max
 */
-std::optional<std::uint64_t>
+std::vector<std::optional<std::uint64_t>>
 LSMEngine::put_batch(std::vector<std::pair<std::string, std::string>> kvs,
 					 std::vector<std::uint64_t> commit_sequences) {
+	if (kvs.size() != commit_sequences.size()) {
+		return std::vector<std::optional<std::uint64_t>>();
+	}
+	std::vector<std::optional<std::uint64_t>> res =
+		std::vector<std::optional<std::uint64_t>>(kvs.size(), std::nullopt);
 	{
-		std::shared_lock<std::shared_mutex> shared(_close_mutex);
-		if (_close) { return std::nullopt; }
-		_memtable.put_batch(kvs, commit_sequences);
+		{
+			std::lock_guard<std::mutex> lguard(_wal_write_mutex);
+			std::shared_lock<std::shared_mutex> shared(_close_mutex);
+			for (std::size_t i = 0; i < kvs.size(); i++) {
+				res[i] = apply_insert(kvs[i].first, kvs[i].second,
+									  commit_sequences[i], ValueType::Value);
+				if (res[i] == std::nullopt) { break; }
+			}
+		}
 	}
 	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
-	std::uint64_t max_seq = 0;
-	for (auto x : commit_sequences) {
-		max_seq = std::max(max_seq, x);
-	}
-	if (max_seq == 0) { return _commit_sequence.load(); }
-	return max_seq;
+	return res;
 }
 
 /**
@@ -196,21 +392,27 @@ LSMEngine::put_batch(std::vector<std::pair<std::string, std::string>> kvs,
 		nullopt = 引擎已关闭拒绝
 		max_commit_sequence: 本次写的 seq / 整批 max
 */
-std::optional<std::uint64_t>
+std::vector<std::optional<std::uint64_t>>
 LSMEngine::remove_batch(std::vector<std::string> ks,
 						std::vector<std::uint64_t> commit_sequences) {
+	if (ks.size() != commit_sequences.size()) {
+		return std::vector<std::optional<std::uint64_t>>();
+	}
+	std::vector<std::optional<std::uint64_t>> res =
+		std::vector<std::optional<std::uint64_t>>(ks.size(), std::nullopt);
 	{
-		std::shared_lock<std::shared_mutex> shared(_close_mutex);
-		if (_close) { return std::nullopt; }
-		_memtable.remove_batch(ks, commit_sequences);
+		{
+			std::lock_guard<std::mutex> lguard(_wal_write_mutex);
+			std::shared_lock<std::shared_mutex> shared(_close_mutex);
+			for (std::size_t i = 0; i < ks.size(); i++) {
+				res[i] = apply_insert(ks[i], "", commit_sequences[i],
+									  ValueType::TombStone);
+				if (res[i] == std::nullopt) { break; }
+			}
+		}
 	}
 	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
-	std::uint64_t max_seq = 0;
-	for (auto x : commit_sequences) {
-		max_seq = std::max(max_seq, x);
-	}
-	if (max_seq == 0) { return _commit_sequence.load(); }
-	return max_seq;
+	return res;
 }
 /**
 	-- return:
@@ -240,11 +442,11 @@ std::optional<std::uint64_t> LSMEngine::remove(const std::string &key) {
 		nullopt = 引擎已关闭拒绝
 		max_commit_sequence: 本次写的 seq / 整批 max
 */
-std::optional<std::uint64_t>
+std::vector<std::optional<std::uint64_t>>
 LSMEngine::put_batch(std::vector<std::pair<std::string, std::string>> kvs) {
 	for (std::size_t i = 0; i < kvs.size(); i++) {
 		if (kvs[i].second.size() > Block::MAX_VALUE_LEN - 1) {
-			return std::nullopt;
+			return std::vector<std::optional<std::uint64_t>>();
 		}
 	}
 	std::vector<std::uint64_t> seqs;
@@ -259,7 +461,7 @@ LSMEngine::put_batch(std::vector<std::pair<std::string, std::string>> kvs) {
 		nullopt = 引擎已关闭拒绝
 		max_commit_sequence: 本次写的 seq / 整批 max
 */
-std::optional<std::uint64_t>
+std::vector<std::optional<std::uint64_t>>
 LSMEngine::remove_batch(std::vector<std::string> ks) {
 	std::vector<std::uint64_t> seqs;
 	for (std::size_t i = 0; i < ks.size(); i++) {
@@ -545,19 +747,23 @@ LSMEngine::generate_sst_from_bast_iter(BaseIterator &base_iter,
 	bool is_full = false;
 	std::string prev_user_key;
 	while (base_iter.is_valid()) {
-		builder.add((*base_iter).first, (*base_iter).second);
+		if (builder.get_estimated_size() >= max_sst_size) { is_full = true; }
 		std::string user_key = InternalKey::decode((*base_iter).first)._key;
-		if (is_full && user_key != prev_user_key) {
+		if (!builder.empty() && is_full && user_key != prev_user_key) {
 			is_full = false;
 			std::size_t sst_id = 0;
 			sst_id = _next_sst_id;
 			_next_sst_id++;
 			std::shared_ptr<SST> sst =
 				builder.build(sst_id, get_sst_path(sst_id, target_level));
+			if (sst == nullptr) {
+				throw std::runtime_error("sst build failed");
+			}
 			builder = SSTBuilder();
 			ssts.push_back(sst);
 		}
-		if (builder.get_estimated_size() >= max_sst_size) { is_full = true; }
+		bool add_res = builder.add((*base_iter).first, (*base_iter).second);
+		if (!add_res) { throw std::runtime_error("builder add failed"); }
 		prev_user_key = user_key;
 		++base_iter;
 	}
@@ -626,27 +832,43 @@ std::vector<std::shared_ptr<SST>> LSMEngine::compact_near_sorted_level(
 // 压缩整个LSMEngine
 void LSMEngine::compact() { compact(0); }
 
-bool LSMEngine::delete_level(std::size_t level) {
-	if (_sst_id_map.find(level) != _sst_id_map.end()) {
-		std::deque<std::size_t> deque_cur_level = _sst_id_map[level];
-		for (std::size_t id : deque_cur_level) {
-			_ssts[id]->delete_file();
-			_ssts.erase(id);
-		}
-		_sst_id_map.erase(level);
+// 只删给定的旧sst的数据, 其他的数据不要动
+void LSMEngine::delete_level(std::size_t level, std::deque<std::size_t> ids) {
+	std::unordered_set<std::size_t> set(ids.begin(), ids.end());
+	std::deque<std::size_t> new_deque;
+	for (std::size_t id : _sst_id_map[level]) {
+		if (set.find(id) == set.end()) { new_deque.push_back(id); }
 	}
-	return true;
+	for (auto id : ids) {
+		try {
+			bool res = _ssts[id]->delete_file();
+			if (!res) {
+				LOG(Log::LogLevel::ERROR)
+					<< "delete sst file, id: " + std::to_string(id) + " failed";
+			}
+		} catch (const std::exception &e) {
+			LOG(Log::LogLevel::ERROR)
+				<< "delete sst file, id: " + std::to_string(id) +
+					   " failed, e: " + e.what();
+		}
+		_ssts.erase(id);
+	}
+	_sst_id_map[level] = new_deque;
 }
 
-void LSMEngine::insert_level(std::size_t target_level,
-							 std::vector<std::shared_ptr<SST>> ssts) {
-	if (ssts.empty()) return;
+std::deque<std::size_t>
+LSMEngine::insert_level(std::size_t target_level,
+						std::vector<std::shared_ptr<SST>> ssts) {
+	std::deque<std::size_t> ids;
+	if (ssts.empty()) return std::deque<std::size_t>();
 	_cur_max_level = std::max(_cur_max_level, target_level);
 	for (std::shared_ptr<SST> sst : ssts) {
 		std::uint64_t id = sst->get_sst_id();
+		ids.push_back(id);
 		_sst_id_map[target_level].push_back(id);
 		_ssts[id] = sst;
 	}
+	return ids;
 }
 
 void LSMEngine::close() {
@@ -657,9 +879,11 @@ void LSMEngine::close() {
 	while (_memtable.get_total_size() > 0) {
 		flush();
 	}
+	std::lock_guard<std::mutex> wal_write_mutex(_wal_write_mutex);
 	std::vector<std::uint8_t> data =
 		get_bytes_of_uint64t(_commit_sequence.load());
-	FileObj::create_and_write(_com_seq_filepath, data);
+	// FileObj::create_and_write(_com_seq_filepath, data);
+	FileObj::atomic_write(_com_seq_filepath, data);
 }
 
 /**
@@ -679,11 +903,49 @@ void LSMEngine::compact(std::size_t start_level) {
 				start_level, start_level + 1, start_level + 1,
 				get_level_sst_size(start_level + 1));
 		}
-		delete_level(start_level);
-		delete_level(start_level + 1);
-		insert_level(start_level + 1, new_ssts);
+		std::deque<std::size_t> delete_level_ids_1 = _sst_id_map[start_level],
+								delete_level_ids_2 =
+									_sst_id_map[start_level + 1];
+
+		std::deque<std::size_t> new_ids =
+			insert_level(start_level + 1, new_ssts);
+		// 把旧的sst对应的manifest数据删掉,
+		// 把新insert进去的sst对应的manifest数据加上
+		renew_manifest_without_delete_with_insert(start_level, start_level + 1,
+												  new_ids);
+
+		// 这两个删除都是要只删旧sst, 不要把新插入的sst也删掉了
+		delete_level(start_level, delete_level_ids_1);
+		delete_level(start_level + 1, delete_level_ids_2);
+
 		start_level++;
 	}
+}
+
+// level1的sst不算, level2的sst只算ids范围内的
+void LSMEngine::renew_manifest_without_delete_with_insert(
+	std::size_t level1, std::size_t level2, std::deque<std::size_t> new_ids) {
+	std::string manifest_filepath = _data_dir + "/" + DEFAULT_MANIFEST_FILENAME;
+
+	std::vector<std::uint8_t> data;
+	for (const auto &[level, ids] : _sst_id_map) {
+		if (level == level1) {
+			continue;
+		} else if (level == level2) {
+			for (std::size_t id : new_ids) {
+				std::string str =
+					std::to_string(id) + "," + std::to_string(level) + "\n";
+				data.insert(data.end(), str.begin(), str.end());
+			}
+		} else {
+			for (std::size_t id : ids) {
+				std::string str =
+					std::to_string(id) + "," + std::to_string(level) + "\n";
+				data.insert(data.end(), str.begin(), str.end());
+			}
+		}
+	}
+	FileObj::atomic_write(manifest_filepath, data);
 }
 
 std::size_t LSMEngine::get_level_sst_size(std::size_t level) {
@@ -1037,11 +1299,12 @@ std::optional<std::uint64_t> LSM::put(const std::string &key,
 std::optional<std::uint64_t> LSM::remove(const std::string &key) {
 	return _engine->remove(key);
 }
-std::optional<std::uint64_t>
+std::vector<std::optional<std::uint64_t>>
 LSM::put_batch(std::vector<std::pair<std::string, std::string>> kvs) {
 	return _engine->put_batch(kvs);
 }
-std::optional<std::uint64_t> LSM::remove_batch(std::vector<std::string> ks) {
+std::vector<std::optional<std::uint64_t>>
+LSM::remove_batch(std::vector<std::string> ks) {
 	return _engine->remove_batch(ks);
 }
 LookUpResult LSM::get(const std::string &key) {

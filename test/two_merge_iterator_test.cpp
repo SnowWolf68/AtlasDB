@@ -47,7 +47,7 @@ std::shared_ptr<BaseIterator> make_mem_iter(
 	bool keep_all) {
 	MemTable table;
 	for (auto &[key, value, seq] : kvs) {
-		CHECK(table.put(key, value, seq));
+		CHECK(table.put(key, value, seq)._is_add);
 	}
 	return std::make_shared<HeapIterator>(
 		std::move(table.begin(std::nullopt, keep_all)));
@@ -192,8 +192,8 @@ void test_end_equality_and_empty() {
 // 7. 墓碑：源流已滤墓碑（begin 默认 skip_tombstone），归并层不再重复输出
 void test_tombstone_filtered_by_source() {
 	MemTable table;
-	CHECK(table.put("k", "v", 5));
-	CHECK(table.remove("k", 10)); // 墓碑覆盖
+	CHECK(table.put("k", "v", 5)._is_add);
+	CHECK(table.remove("k", 10)._is_success); // 墓碑覆盖
 	// begin() 默认 skip_tombstone=true：墓碑及其旧版本都被源流滤掉 → 空流
 	auto source = std::make_shared<HeapIterator>(
 		std::move(table.begin(std::nullopt, false)));

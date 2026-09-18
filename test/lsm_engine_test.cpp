@@ -270,11 +270,16 @@ void test_put_return_value_semantics() {
 		auto s1 = engine.put("a", "v");
 		auto s2 = engine.put("b", "v");
 		CHECK(s1.has_value() && s2.has_value() && *s2 > *s1);
-		// batch：返回整批最大 seq（≥ 单条递增到的值）
+		// batch：逐条返回 seq，与输入顺序对应且严格递增
 		std::vector<std::pair<std::string, std::string>> kvs = {
 			{"x", "1"}, {"y", "2"}, {"z", "3"}};
 		auto sb = engine.put_batch(kvs);
-		CHECK(sb.has_value() && *sb > *s2);
+		CHECK(sb.size() == kvs.size());
+		std::uint64_t previous = *s2;
+		for (const auto &seq : sb) {
+			CHECK(seq.has_value() && *seq > previous);
+			previous = *seq;
+		}
 		// 超限 value：单条拒绝
 		CHECK(!engine.put("big", std::string(64 * 1024 + 1, 'v')).has_value());
 	}
@@ -779,127 +784,44 @@ void test_seq_watermark_no_regression_on_reopen() {
 }
 
 int main() {
-	const char *cases[] = {
-		"test_constructor_creates_dir_and_empty_flush",
-		"test_put_triggers_flush_and_creates_file",
-		"test_flush_content_roundtrip",
-		"test_multiple_flushes_increasing_ids",
-		"test_remove_flushes_tombstone",
-		"test_put_return_value_semantics",
-		"test_get_after_flush",
-		"test_memtable_tombstone_shortcircuit",
-		"test_sst_tombstone_shortcircuit",
-		"test_multi_version_seq_filter",
-		"test_restart_recovery",
-		"test_level1_read_path",
-		"test_multi_block_read",
-		"test_get_batch_all_hit",
-		"test_get_batch_mixed",
-		"test_get_batch_tombstone_shortcircuit",
-		"test_get_batch_consistent_with_get",
-		"test_concat_iterator_traversal",
-		"test_concat_iterator_empty_level",
-		"test_concat_iterator_snapshot_and_keepall",
-		"test_concat_iterator_consistent_with_get",
-		"test_seq_watermark_no_regression_on_reopen",
+	struct TestCase { const char *name; void (*run)(); };
+	const TestCase cases[] = {
+		{"test_constructor_creates_dir_and_empty_flush", test_constructor_creates_dir_and_empty_flush},
+		{"test_put_triggers_flush_and_creates_file", test_put_triggers_flush_and_creates_file},
+		{"test_flush_content_roundtrip", test_flush_content_roundtrip},
+		{"test_multiple_flushes_increasing_ids", test_multiple_flushes_increasing_ids},
+		{"test_remove_flushes_tombstone", test_remove_flushes_tombstone},
+		{"test_put_return_value_semantics", test_put_return_value_semantics},
+		{"test_get_after_flush", test_get_after_flush},
+		{"test_memtable_tombstone_shortcircuit", test_memtable_tombstone_shortcircuit},
+		{"test_sst_tombstone_shortcircuit", test_sst_tombstone_shortcircuit},
+		{"test_multi_version_seq_filter", test_multi_version_seq_filter},
+		{"test_restart_recovery", test_restart_recovery},
+		{"test_level1_read_path", test_level1_read_path},
+		{"test_multi_block_read", test_multi_block_read},
+		{"test_get_batch_all_hit", test_get_batch_all_hit},
+		{"test_get_batch_mixed", test_get_batch_mixed},
+		{"test_get_batch_tombstone_shortcircuit", test_get_batch_tombstone_shortcircuit},
+		{"test_get_batch_consistent_with_get", test_get_batch_consistent_with_get},
+		{"test_concat_iterator_traversal", test_concat_iterator_traversal},
+		{"test_concat_iterator_empty_level", test_concat_iterator_empty_level},
+		{"test_concat_iterator_snapshot_and_keepall", test_concat_iterator_snapshot_and_keepall},
+		{"test_concat_iterator_consistent_with_get", test_concat_iterator_consistent_with_get},
+		{"test_seq_watermark_no_regression_on_reopen", test_seq_watermark_no_regression_on_reopen},
 	};
-
 	int passed = 0;
-	int total = sizeof(cases) / sizeof(cases[0]);
-	try {
-		test_constructor_creates_dir_and_empty_flush();
-		std::cout << "[PASS] " << cases[0] << "\n";
-		passed++;
-
-		test_put_triggers_flush_and_creates_file();
-		std::cout << "[PASS] " << cases[1] << "\n";
-		passed++;
-
-		test_flush_content_roundtrip();
-		std::cout << "[PASS] " << cases[2] << "\n";
-		passed++;
-
-		test_multiple_flushes_increasing_ids();
-		std::cout << "[PASS] " << cases[3] << "\n";
-		passed++;
-
-		test_remove_flushes_tombstone();
-		std::cout << "[PASS] " << cases[4] << "\n";
-		passed++;
-
-		test_put_return_value_semantics();
-		std::cout << "[PASS] " << cases[5] << "\n";
-		passed++;
-
-		test_get_after_flush();
-		std::cout << "[PASS] " << cases[6] << "\n";
-		passed++;
-
-		test_memtable_tombstone_shortcircuit();
-		std::cout << "[PASS] " << cases[7] << "\n";
-		passed++;
-
-		test_sst_tombstone_shortcircuit();
-		std::cout << "[PASS] " << cases[8] << "\n";
-		passed++;
-
-		test_multi_version_seq_filter();
-		std::cout << "[PASS] " << cases[9] << "\n";
-		passed++;
-
-		test_restart_recovery();
-		std::cout << "[PASS] " << cases[10] << "\n";
-		passed++;
-
-		test_level1_read_path();
-		std::cout << "[PASS] " << cases[11] << "\n";
-		passed++;
-
-		test_multi_block_read();
-		std::cout << "[PASS] " << cases[12] << "\n";
-		passed++;
-
-		test_get_batch_all_hit();
-		std::cout << "[PASS] " << cases[13] << "\n";
-		passed++;
-
-		test_get_batch_mixed();
-		std::cout << "[PASS] " << cases[14] << "\n";
-		passed++;
-
-		test_get_batch_tombstone_shortcircuit();
-		std::cout << "[PASS] " << cases[15] << "\n";
-		passed++;
-
-		test_get_batch_consistent_with_get();
-		std::cout << "[PASS] " << cases[16] << "\n";
-		passed++;
-
-		test_concat_iterator_traversal();
-		std::cout << "[PASS] " << cases[17] << "\n";
-		passed++;
-
-		test_concat_iterator_empty_level();
-		std::cout << "[PASS] " << cases[18] << "\n";
-		passed++;
-
-		test_concat_iterator_snapshot_and_keepall();
-		std::cout << "[PASS] " << cases[19] << "\n";
-		passed++;
-
-		test_concat_iterator_consistent_with_get();
-		std::cout << "[PASS] " << cases[20] << "\n";
-		passed++;
-
-		test_seq_watermark_no_regression_on_reopen();
-		std::cout << "[PASS] " << cases[21] << "\n";
-		passed++;
-	} catch (const TestFailure &e) {
-		std::cerr << "[FAIL] " << e.what() << "\n";
-	} catch (const std::exception &e) {
-		std::cerr << "[ERROR] unexpected exception: " << e.what() << "\n";
+	const int total = sizeof(cases) / sizeof(cases[0]);
+	// Keep running independent cases after a failure so a regression cannot
+	// hide the remainder of the engine coverage.
+	for (const auto &test : cases) {
+		try {
+			test.run();
+			std::cout << "[PASS] " << test.name << "\n";
+			++passed;
+		} catch (const std::exception &e) {
+			std::cerr << "[FAIL] " << test.name << ": " << e.what() << "\n";
+		}
 	}
-
 	std::cout << passed << "/" << total << " tests passed\n";
 	return passed == total ? 0 : 1;
 }

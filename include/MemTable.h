@@ -70,10 +70,46 @@ private:
 };
 
 class MemTable {
+
+	friend class WAL;
+
 	inline static const std::string EMPTY_VALUE = "";
 	static const int SEQ_AND_VALTYPE_SIZE = 8;
 
 public:
+	class PutResult {
+	public:
+		bool _is_add;
+		std::optional<std::uint64_t> _frozen_list_id;
+		std::optional<std::uint64_t> _new_active_list_id;
+
+		PutResult(bool is_add);
+		PutResult(bool is_add, std::uint64_t frozen_list_id,
+				  std::uint64_t new_active_list_id);
+	};
+
+	class RemoveResult {
+	public:
+		bool _is_success;
+		std::optional<std::uint64_t> _frozen_list_id;
+		std::optional<std::uint64_t> _new_active_list_id;
+
+		RemoveResult(bool is_success);
+		RemoveResult(bool is_success, std::uint64_t frozen_list_id,
+					 std::uint64_t new_active_list_id);
+	};
+
+	class FlushLastResult {
+	public:
+		std::shared_ptr<SST> _sst;
+		std::optional<std::uint64_t> _flush_id;
+		std::optional<std::uint64_t> _new_active_id;
+
+		FlushLastResult(std::shared_ptr<SST> sst,
+						std::optional<std::uint64_t> flush_id,
+						std::optional<std::uint64_t> new_active_id);
+	};
+
 	static const std::size_t MAX_ACTIVE_BYTES = 4ULL * 1024 * 1024; // 4MB
 
 	MemTable(std::size_t max_active_bytes = MAX_ACTIVE_BYTES,
@@ -81,15 +117,17 @@ public:
 				 std::make_shared<InternalKeyComparator>());
 
 
-	bool put(const std::string &key, const std::string &value,
-			 std::uint64_t commit_sequence);
+	PutResult put(const std::string &key, const std::string &value,
+				  std::uint64_t commit_sequence);
 
 	LookUpResult get(const std::string &key, std::uint64_t commit_sequence);
 
-	bool remove(const std::string &key, std::uint64_t commit_sequence);
+	RemoveResult remove(const std::string &key, std::uint64_t commit_sequence);
 
 	bool put_batch(std::vector<std::pair<std::string, std::string>> kvs,
 				   std::vector<std::uint64_t> commit_sequences);
+
+	void put_entry_data(const std::string &enc_key, const std::string &value);
 
 	std::vector<LookUpResult>
 	get_batch(std::vector<std::string> ks,
@@ -109,10 +147,9 @@ public:
 							std::uint64_t commit_sequence, bool skip_tombstone,
 							bool keep_all_version);
 
-	std::shared_ptr<SST> flush_last(SSTBuilder &builder,
-									const std::string &sst_path,
-									std::uint64_t sst_id,
-									std::vector<std::uint64_t> &flushed_seqs);
+	MemTable::FlushLastResult
+	flush_last(SSTBuilder &builder, const std::string &sst_path,
+			   std::uint64_t sst_id, std::vector<std::uint64_t> &flushed_seqs);
 	std::size_t get_total_size();
 	void clear();
 
@@ -133,21 +170,37 @@ private:
 		_frozen_mutex; // frozen_lists只有读, 但是有可能会增加skiplist,
 					   // 因此整个容器一把锁即可
 
+	std::uint64_t _active_id;
+	std::deque<std::uint64_t> _frozen_ids;
 
 	bool put_single_skiplist(std::shared_ptr<SkipList> skiplist,
 							 const std::string &key, const std::string &value,
-							 std::uint64_t commit_sequence);
-
+							 std::uint64_t commit_sequence,
+							 ValueType value_type = ValueType::Value);
+	bool put_single_skiplist(std::shared_ptr<SkipList> skiplist,
+							 const std::string &enc_key,
+							 const std::string &value);
 	SkipList::ConstIterator
 	get_lower_bound_single_skiplist(std::shared_ptr<const SkipList> skiplist,
 									const std::string &key,
 									std::uint64_t commit_sequence);
 
+	std::optional<std::string> get_precise_single_skiplist(
+		std::shared_ptr<const SkipList> skiplist, const std::string &key,
+		std::uint64_t commit_sequence, ValueType value_type);
+
+	std::optional<std::string>
+	get_precise_single_skiplist(std::shared_ptr<const SkipList> skiplist,
+								const std::string &enc_key);
+
 	bool remove_single_skiplist(std::shared_ptr<SkipList> skiplist,
 								const std::string &key,
 								std::uint64_t commit_sequence);
 
-	bool froze_with_active_unique();
+	/**
+	<frozen_list_id, new_active_list_id>
+	*/
+	std::pair<std::uint64_t, std::uint64_t> froze_with_active_unique();
 
 	static std::string get_next_str(const std::string &str);
 };

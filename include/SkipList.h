@@ -59,7 +59,7 @@ public:
 	SkipList &operator=(SkipList &&other);
 
 	bool put(std::string key, std::string value);
-	bool get(const std::string &key, std::string &value);
+	bool get(const std::string &key, std::string &value) const;
 	bool del(const std::string &key);
 	ConstIterator lower_bound(const std::string &key) const;
 
@@ -78,7 +78,7 @@ public:
 
 	std::size_t size();
 	std::size_t get_byte_size() const;
-	bool empty();
+	bool empty() const;
 	void clear();
 	~SkipList();
 
@@ -100,8 +100,8 @@ private:
 
 	int get_level(int max_level);
 
-	SkipListNode *find_or_prev(const std::string &key);
+	const SkipListNode *find_or_prev(const std::string &key) const;
 	std::vector<SkipListNode *> find_with_path(const std::string &key);
-	SkipListNode *find(const std::string &key);
+	const SkipListNode *find(const std::string &key) const;
 	const SkipListNode *lower_bound_node(const std::string &key) const;
 };

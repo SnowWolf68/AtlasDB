@@ -49,12 +49,7 @@ struct FlushedEntry {
 
 // 全量读出 SST 的所有 entry（跨 block，含同一 user_key 的全部版本）
 //
-// 注意: 不能用 SST::begin()/end() 做全量校验——SST::begin() 走
-// get(get_first_key())，其迭代器带首 key 的 commit_sequence 过滤
-// （clean_by_commit_sequence 清掉 seq 更大的条目），且
-// BlockIterator::operator++ 在 keep_all_version=false 时会跳过
-// 同 user_key 的旧版本。校验 flush 内容必须直接遍历 block
-// （keep_all_version=true, 无 seq 过滤）。
+// 逐块显式使用 (nullopt, true)，保留所有版本与墓碑，避免读语义过滤。
 std::vector<FlushedEntry> read_all_entries(const std::shared_ptr<SST> &sst) {
 	std::vector<FlushedEntry> entries;
 	for (std::size_t b = 0; b < sst->num_blocks(); b++) {
@@ -78,7 +73,7 @@ std::shared_ptr<SST> flush_once(MemTable &table, std::uint64_t sst_id,
 								const std::string &path,
 								std::vector<std::uint64_t> &flushed_seqs) {
 	SSTBuilder builder;
-	return table.flush_last(builder, path, sst_id, flushed_seqs);
+	return table.flush_last(builder, path, sst_id, flushed_seqs)._sst;
 }
 
 // ─── tests ──────────────────────────────────────────────────────
@@ -94,9 +89,9 @@ void test_flush_empty_returns_nullptr() {
 
 void test_flush_active_only() {
 	MemTable table;
-	CHECK(table.put("alpha", "1", 1));
-	CHECK(table.put("bravo", "2", 2));
-	CHECK(table.put("charlie", "3", 3));
+	CHECK(table.put("alpha", "1", 1)._is_add);
+	CHECK(table.put("bravo", "2", 2)._is_add);
+	CHECK(table.put("charlie", "3", 3)._is_add);
 
 	std::string path = tmp_path("active");
 	rm_tmp(path);
@@ -133,75 +128,54 @@ void test_flush_active_only() {
 }
 
 void test_flush_oldest_frozen_first() {
-	MemTable table;
+	// 每条 21B，两条超过 40B；同一 batch 形成两张 frozen 表。
+	MemTable table(40);
+	const std::string value(10, 'v');
+	CHECK(table.put_batch({{"a-0", value}, {"a-1", value},
+						   {"a-2", value}, {"a-3", value}}, {1, 2, 3, 4}));
+	CHECK(table.put("b-0", value, 5)._is_add);
+	CHECK(table.get_total_size() == 105);
 
-	// A 批: put_batch 一次性超过 4MB 阈值 → 结束时触发一次冻结
-	// 7(key) + 70(value) + 8 = 85B × 50000 ≈ 4.25MB
-	const int A_COUNT = 50000;
-	std::string big_value(70, 'v');
-	std::vector<std::pair<std::string, std::string>> kvs_a;
-	std::vector<std::uint64_t> seqs_a;
-	for (int i = 0; i < A_COUNT; i++) {
-		char buf[16];
-		std::snprintf(buf, sizeof(buf), "a-%05d", i);
-		kvs_a.push_back({std::string(buf), big_value});
-		seqs_a.push_back(static_cast<std::uint64_t>(i + 1));
+	const std::vector<std::vector<std::string>> expected = {
+		{"a-0", "a-1"}, {"a-2", "a-3"}, {"b-0"}};
+	std::size_t remaining_bytes = 105;
+	std::uint64_t next_seq = 1;
+	for (std::size_t generation = 0; generation < expected.size(); ++generation) {
+		const std::string path = tmp_path("fifo_" + std::to_string(generation));
+		SSTBuilder builder;
+		std::vector<std::uint64_t> seqs;
+		auto result = table.flush_last(builder, path, generation + 1, seqs);
+		CHECK(result._sst != nullptr);
+		CHECK(result._flush_id == generation);
+		if (generation < 2) {
+			CHECK(!result._new_active_id);
+		} else {
+			CHECK(result._new_active_id == 3);
+		}
+		auto entries = read_all_entries(result._sst);
+		CHECK(entries.size() == expected[generation].size());
+		CHECK(seqs.size() == entries.size());
+		for (std::size_t i = 0; i < entries.size(); ++i) {
+			CHECK(entries[i]._key == expected[generation][i]);
+			CHECK(entries[i]._value == value && entries[i]._type == Value);
+			CHECK(entries[i]._seq == next_seq && seqs[i] == next_seq);
+			++next_seq;
+		}
+		remaining_bytes -= entries.size() * 21;
+		CHECK(table.get_total_size() == remaining_bytes);
+		rm_tmp(path);
 	}
-	CHECK(table.put_batch(kvs_a, seqs_a));
-
-	// B 批: 少量数据落在冻结后新建的 active 表
-	CHECK(table.put("b-0", "B0", 50001));
-	CHECK(table.put("b-1", "B1", 50002));
-	CHECK(table.put("b-2", "B2", 50003));
-
-	std::string path_1 = tmp_path("frozen_1"), path_2 = tmp_path("frozen_2");
-	rm_tmp(path_1);
-	rm_tmp(path_2);
-
-	// 第一次 flush: 弹出最老的 frozen 表（A 批）
-	std::vector<std::uint64_t> flushed_seqs_1;
-	std::shared_ptr<SST> sst_1 = flush_once(table, 1, path_1, flushed_seqs_1);
-	CHECK(sst_1 != nullptr);
-	std::vector<FlushedEntry> entries_1 = read_all_entries(sst_1);
-	CHECK(entries_1.size() == A_COUNT);
-	for (const FlushedEntry &entry : entries_1) {
-		CHECK(entry._key.compare(0, 2, "a-") == 0);
-		CHECK(entry._value == big_value);
-		CHECK(entry._type == Value);
-	}
-	// key 升序 → seq 升序（seqs_a[i] = i + 1）
-	CHECK(entries_1.front()._seq == 1);
-	CHECK(entries_1.back()._seq == A_COUNT);
-	CHECK(flushed_seqs_1.size() == A_COUNT);
-
-	// 第二次 flush: frozen 空 → 直接取 active（B 批）
-	std::vector<std::uint64_t> flushed_seqs_2;
-	std::shared_ptr<SST> sst_2 = flush_once(table, 2, path_2, flushed_seqs_2);
-	CHECK(sst_2 != nullptr);
-	std::vector<FlushedEntry> entries_2 = read_all_entries(sst_2);
-	CHECK(entries_2.size() == 3);
-	CHECK(entries_2[0]._key == "b-0" && entries_2[0]._value == "B0");
-	CHECK(entries_2[1]._key == "b-1" && entries_2[1]._value == "B1");
-	CHECK(entries_2[2]._key == "b-2" && entries_2[2]._value == "B2");
-	CHECK(flushed_seqs_2.size() == 3);
-
-	// 最老的先刷: sst_1 的最大 seq 早于 sst_2 的最小 seq
-	CHECK(entries_1.back()._seq < entries_2.front()._seq);
-
-	// 第三次 flush → 空
-	std::vector<std::uint64_t> flushed_seqs_3;
-	std::shared_ptr<SST> sst_3 = flush_once(table, 3, path_1, flushed_seqs_3);
-	CHECK(sst_3 == nullptr);
-	CHECK(flushed_seqs_3.empty());
-
-	rm_tmp(path_1);
-	rm_tmp(path_2);
+	SSTBuilder builder;
+	std::vector<std::uint64_t> seqs;
+	auto empty = table.flush_last(builder, tmp_path("fifo_empty"), 4, seqs);
+	CHECK(!empty._sst && !empty._flush_id && !empty._new_active_id);
+	CHECK(seqs.empty());
 }
 
 void test_flush_keeps_tombstone() {
 	MemTable table;
-	CHECK(table.put("key", "value", 1));
-	CHECK(table.remove("key", 2));
+	CHECK(table.put("key", "value", 1)._is_add);
+	CHECK(table.remove("key", 2)._is_success);
 
 	std::string path = tmp_path("tombstone");
 	rm_tmp(path);
@@ -224,8 +198,8 @@ void test_flush_keeps_tombstone() {
 
 void test_flush_keeps_multiple_versions() {
 	MemTable table;
-	CHECK(table.put("k", "old", 1));
-	CHECK(table.put("k", "new", 3));
+	CHECK(table.put("k", "old", 1)._is_add);
+	CHECK(table.put("k", "new", 3)._is_add);
 
 	std::string path = tmp_path("versions");
 	rm_tmp(path);
@@ -246,8 +220,8 @@ void test_flush_keeps_multiple_versions() {
 
 void test_reopen_sst_from_disk() {
 	MemTable table;
-	CHECK(table.put("alpha", "hello", 10));
-	CHECK(table.put("bravo", "world", 20));
+	CHECK(table.put("alpha", "hello", 10)._is_add);
+	CHECK(table.put("bravo", "world", 20)._is_add);
 
 	std::string path = tmp_path("reopen");
 	rm_tmp(path);
@@ -270,7 +244,7 @@ void test_reopen_sst_from_disk() {
 
 void test_memtable_usable_after_flush() {
 	MemTable table;
-	CHECK(table.put("old-key", "old", 1));
+	CHECK(table.put("old-key", "old", 1)._is_add);
 
 	std::string path = tmp_path("usable");
 	rm_tmp(path);
@@ -282,7 +256,7 @@ void test_memtable_usable_after_flush() {
 	CHECK(table.get("old-key", 100)._value_type == NotFound);
 
 	// flush 后继续写读
-	CHECK(table.put("new-key", "new", 2));
+	CHECK(table.put("new-key", "new", 2)._is_add);
 	LookUpResult result = table.get("new-key", 2);
 	CHECK(result._value_type == Value);
 	CHECK(result._value == "new");

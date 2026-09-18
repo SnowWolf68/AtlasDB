@@ -1,81 +1,53 @@
-# project(AtlasDB LANGUAGES CXX)
-
-# set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# add_executable(AtlasDB src/log.cpp src/main.cpp)
-
-# target_include_directories(AtlasDB PRIVATE ${CMAKE_SOURCE_DIR}/include)
-
-# target_compile_options(
-#     AtlasDB PRIVATE
-#     "-fmacro-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/="
-# )
-
-# target_compile_definitions(
-#     AtlasDB
-#     PRIVATE
-#     ATLASDB_PROJECT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"
-# )
-
 cmake_minimum_required(VERSION 3.16)
 
-project(AtlasDB LANGUAGES CXX)
+project(AtlasDB VERSION 1.0.0 LANGUAGES CXX)
 
-# 生成 compile_commands.json，方便 clangd 等工具读取编译参数
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# 递归扫描 src 目录下的所有 C++ 源文件
-file(
-    GLOB_RECURSE ATLASDB_SOURCE_FILES
-    CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cxx"
-)
+option(ATLASDB_BUILD_APP "Build the interactive AtlasDB demo" ON)
 
-# 递归扫描 include 目录下的所有头文件
-#
-# 头文件实际上不需要传给 add_executable 才能参与编译，
-# 这里加入主要是为了让 IDE 能在项目文件列表中显示这些头文件。
-file(
-    GLOB_RECURSE ATLASDB_HEADER_FILES
-    CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hh"
-)
+find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 
-# 使用扫描得到的源文件和头文件创建可执行程序
-add_executable(
-    AtlasDB
-    ${ATLASDB_SOURCE_FILES}
-    ${ATLASDB_HEADER_FILES}
+add_library(
+	atlasdb
+	src/Block.cpp
+	src/BlockMeta.cpp
+	src/Comparator.cpp
+	src/MemTable.cpp
+	src/Record.cpp
+	src/SkipList.cpp
+	src/log.cpp
+	src/lsm.cpp
+	src/sst.cpp
+	src/util.cpp
+	src/wal.cpp
 )
+add_library(AtlasDB::AtlasDB ALIAS atlasdb)
 
-# 指定头文件搜索目录
-#
-# 源码中可以这样包含：
-#   #include "log.h"
-#   #include "storage/memtable.h"
+target_compile_features(atlasdb PUBLIC cxx_std_17)
 target_include_directories(
-    AtlasDB
-    PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+	atlasdb
+	PUBLIC
+		$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+		$<INSTALL_INTERFACE:include>
 )
+target_link_libraries(atlasdb PUBLIC Threads::Threads ZLIB::ZLIB)
 
-# 将源码路径从 __FILE__ 等宏中移除，避免生成绝对路径
-target_compile_options(
-    AtlasDB
-    PRIVATE
-    "-fmacro-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/="
-)
+# FileSink paths are interpreted relative to the process working directory.
+# This keeps built artifacts independent of the source checkout location.
+target_compile_definitions(atlasdb PRIVATE ATLASDB_PROJECT_DIR="")
 
-# 定义 ATLASDB_PROJECT_DIR 宏
-#
-# C++ 中可以直接使用：
-#   std::cout << ATLASDB_PROJECT_DIR;
-target_compile_definitions(
-    AtlasDB
-    PRIVATE
-    ATLASDB_PROJECT_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+	target_compile_options(atlasdb PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(ATLASDB_BUILD_APP)
+	add_executable(AtlasDB src/main.cpp)
+	target_link_libraries(AtlasDB PRIVATE AtlasDB::AtlasDB)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+	add_subdirectory(test)
+endif()

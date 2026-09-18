@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -55,8 +56,16 @@ public:
 
 	static FileObj create_and_write(const std::string &path,
 									std::vector<std::uint8_t> data);
+	static FileObj create_rw(const std::string &path);
+	static FileObj open_rw(const std::string &path);
+
+	static bool atomic_write(const std::string &file_path,
+							 const std::vector<std::uint8_t> &data);
+	static void fsync_parent_path(const std::string &file_path);
+
 	std::vector<std::uint8_t> read(std::size_t offset,
 								   std::size_t length) const;
+	std::vector<std::uint8_t> read_continue(std::size_t length) const;
 	std::uint64_t read_uint64(std::size_t offset) const;
 	std::uint32_t read_uint32(std::size_t offset) const;
 	std::uint16_t read_uint16(std::size_t offset) const;
@@ -66,6 +75,9 @@ public:
 	static std::vector<std::uint8_t> get_bytes_of_uint64(std::uint64_t n);
 
 	bool append_data(std::vector<std::uint8_t> data);
+	bool clear();
+	bool fsync();
+	bool seek_begin();
 
 	bool close();
 	std::size_t size() const;

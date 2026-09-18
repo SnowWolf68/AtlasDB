@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -210,6 +211,62 @@ void test_create_write_and_read_empty() {
 	rm_tmp(path);
 }
 
+// ─── atomic_write ──────────────────────────────────────────────
+
+void test_atomic_write_publishes_and_replaces() {
+	std::string path = tmp_path("test_atomic_write");
+	std::string tmp = path + ".tmp";
+
+	CHECK(FileObj::atomic_write(path, get_bytes_of_uint64t(7)));
+	CHECK(!std::filesystem::exists(tmp)); // tmp consumed by rename
+	{
+		auto f = FileObj::open_read(path);
+		CHECK(f.is_valid());
+		CHECK(f.size() == 8);
+		CHECK(f.read_uint64(0) == 7);
+		f.close();
+	}
+
+	// A second publish atomically replaces the first one.
+	CHECK(FileObj::atomic_write(path, get_bytes_of_uint64t(9)));
+	CHECK(!std::filesystem::exists(tmp));
+	{
+		auto f = FileObj::open_read(path);
+		CHECK(f.size() == 8);
+		CHECK(f.read_uint64(0) == 9);
+		f.close();
+	}
+
+	rm_tmp(path);
+	rm_tmp(tmp);
+}
+
+std::size_t open_fd_count() {
+	// directory_iterator itself holds one descriptor; both counts include it.
+	std::size_t count = 0;
+	for (const auto &entry :
+		 std::filesystem::directory_iterator("/proc/self/fd")) {
+		(void)entry;
+		++count;
+	}
+	return count;
+}
+
+void test_atomic_write_leaks_no_descriptor() {
+#if defined(__linux__)
+	std::string path = tmp_path("test_atomic_fd");
+	const std::size_t before = open_fd_count();
+	for (int i = 0; i < 30; i++) {
+		CHECK(FileObj::atomic_write(path, get_bytes_of_uint64t(i)));
+	}
+	CHECK(open_fd_count() == before);
+	rm_tmp(path);
+	rm_tmp(path + ".tmp");
+#else
+	std::cout << "[SKIP] /proc/self/fd descriptor accounting unavailable\n";
+#endif
+}
+
 // ─── test runner ────────────────────────────────────────────────
 
 struct TestCase {
@@ -233,6 +290,10 @@ int main() {
 		{"close then operations fail", test_close_then_operations_return_fail},
 		{"create write and read empty",
 		 test_create_write_and_read_empty},
+		{"atomic write publishes and replaces",
+		 test_atomic_write_publishes_and_replaces},
+		{"atomic write leaks no descriptor",
+		 test_atomic_write_leaks_no_descriptor},
 	};
 
 	std::size_t passed = 0;

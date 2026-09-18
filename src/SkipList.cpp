@@ -87,8 +87,8 @@ find_or_prev不会用head与要查询的key作比较, 但是find_or_prev有可�
 因此如果find_or_prev返回的key和find要查询的key相同时,
 需要看一下find_or_prev返回的是不是head
 */
-SkipListNode *SkipList::find(const std::string &key) {
-	SkipListNode *res = find_or_prev(key);
+const SkipListNode *SkipList::find(const std::string &key) const {
+	const SkipListNode *res = find_or_prev(key);
 	if (res != &_head && // 由于res有可能是_head, 如果对_head.key = ""
 						 // 调用comparator会报错,
 						 // 因此需要将与_head的比较放在前面
@@ -103,9 +103,9 @@ SkipListNode *SkipList::find(const std::string &key) {
 find_or_prev不会用head与要查询的key作比较
 Note: 但是有可能会返回_head
 */
-SkipListNode *SkipList::find_or_prev(const std::string &key) {
+const SkipListNode *SkipList::find_or_prev(const std::string &key) const {
 	int level_idx = _head._next.size() - 1;
-	SkipListNode *p = &_head;
+	const SkipListNode *p = &_head;
 	while (level_idx > 0) {
 		while (p->_next[level_idx] != nullptr &&
 			   (*_cmp)(p->_next[level_idx]->_key, key) < 0) {
@@ -202,8 +202,8 @@ bool SkipList::put(std::string key, std::string value) {
 }
 
 
-bool SkipList::get(const std::string &key, std::string &value) {
-	SkipListNode *find_res = find(key);
+bool SkipList::get(const std::string &key, std::string &value) const {
+	const SkipListNode *find_res = find(key);
 	if (find_res != nullptr) {
 		value = find_res->_value;
 		return true;
@@ -360,7 +360,7 @@ std::size_t SkipList::size() { return _size; }
 
 std::size_t SkipList::get_byte_size() const { return _cur_bytes; }
 
-bool SkipList::empty() { return _size == 0; }
+bool SkipList::empty() const { return _size == 0; }
 
 void SkipList::clear() {
 	SkipListNode *p = _head._next[0];

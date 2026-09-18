@@ -1,25 +1,35 @@
 #include "MemTable.h"
 #include "Record.h"
 #include <cassert>
+#include <limits>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
-
 
 MemTable::MemTable(std::size_t max_active_bytes,
 				   std::shared_ptr<const Comparator<std::string>> comparator)
 	: _active_bytes(0), _max_active_bytes(max_active_bytes), _frozen_bytes(0),
 	  _comparator(comparator),
 	  _active_list(std::make_shared<SkipList>(_comparator)),
-	  _frozen_lists(std::deque<std::shared_ptr<const SkipList>>()) {}
+	  _frozen_lists(std::deque<std::shared_ptr<const SkipList>>()),
+	  _active_id(0) {}
 
 bool MemTable::put_single_skiplist(std::shared_ptr<SkipList> skiplist,
 								   const std::string &key,
 								   const std::string &value,
-								   std::uint64_t commit_sequence) {
-	InternalKey intr_key(key, commit_sequence, ValueType::Value);
+								   std::uint64_t commit_sequence,
+								   ValueType value_type) {
+	InternalKey intr_key(key, commit_sequence, value_type);
 	std::string enc_key = InternalKey::encode(intr_key);
+	return skiplist->put(enc_key, value);
+}
+
+bool MemTable::put_single_skiplist(std::shared_ptr<SkipList> skiplist,
+								   const std::string &enc_key,
+								   const std::string &value) {
 	return skiplist->put(enc_key, value);
 }
 
@@ -33,6 +43,25 @@ SkipList::ConstIterator MemTable::get_lower_bound_single_skiplist(
 	InternalKey intr_key(key, commit_sequence, ValueType::Value);
 	std::string enc_key = InternalKey::encode(intr_key);
 	return skiplist->lower_bound(enc_key);
+}
+
+std::optional<std::string> MemTable::get_precise_single_skiplist(
+	std::shared_ptr<const SkipList> skiplist, const std::string &key,
+	std::uint64_t commit_sequence, ValueType value_type) {
+	InternalKey intr_key(key, commit_sequence, value_type);
+	std::string enc_key = InternalKey::encode(intr_key);
+	std::string value;
+	bool find = skiplist->get(enc_key, value);
+	if (!find) { return std::nullopt; }
+	return value;
+}
+
+std::optional<std::string>
+MemTable::get_precise_single_skiplist(std::shared_ptr<const SkipList> skiplist,
+									  const std::string &enc_key) {
+	std::string value;
+	if (!skiplist->get(enc_key, value)) { return std::nullopt; }
+	return value;
 }
 
 /**
@@ -54,26 +83,37 @@ bool MemTable::remove_single_skiplist(std::shared_ptr<SkipList> skiplist,
 true  -- 添加
 false -- 更新
 */
-bool MemTable::put(const std::string &key, const std::string &value,
-				   std::uint64_t commit_sequence) {
+MemTable::PutResult MemTable::put(const std::string &key,
+								  const std::string &value,
+								  std::uint64_t commit_sequence) {
 	std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
-	SkipList::ConstIterator find_it =
-		get_lower_bound_single_skiplist(_active_list, key, commit_sequence);
+	std::optional<std::string> value_opt = get_precise_single_skiplist(
+		_active_list, key, commit_sequence, ValueType::Value);
 	bool res = put_single_skiplist(_active_list, key, value, commit_sequence);
 	if (res) {
 		// res == true: 添加
 		// 更新 active_bytes
 		_active_bytes += key.size() + value.size() + SEQ_AND_VALTYPE_SIZE;
-		if (_active_bytes > _max_active_bytes) { froze_with_active_unique(); }
-		return true;
+		if (_active_bytes > _max_active_bytes) {
+			std::pair<std::uint64_t, std::uint64_t> id_pair =
+				froze_with_active_unique();
+			return PutResult(true, id_pair.first, id_pair.second);
+		} else {
+			return PutResult(true);
+		}
 	} else {
 		// res == false: 更新
 		// 理论上正常情况好像走不到这里, 走的都是添加的逻辑
 		// 这种情况下find_it一定不是nullptr
-		int old_value_bytes = find_it.value().size(), cur_size = value.size();
+		int old_value_bytes = value_opt.value().size(), cur_size = value.size();
 		_active_bytes += (cur_size - old_value_bytes);
-		if (_active_bytes > _max_active_bytes) { froze_with_active_unique(); }
-		return false;
+		if (_active_bytes > _max_active_bytes) {
+			std::pair<std::uint64_t, std::uint64_t> id_pair =
+				froze_with_active_unique();
+			return PutResult(false, id_pair.first, id_pair.second);
+		} else {
+			return PutResult(false);
+		}
 	}
 }
 
@@ -117,25 +157,39 @@ LookUpResult MemTable::get(const std::string &user_key,
 	}
 }
 
-bool MemTable::remove(const std::string &key, std::uint64_t commit_sequence) {
+MemTable::RemoveResult MemTable::remove(const std::string &key,
+										std::uint64_t commit_sequence) {
 	std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
 	bool res = remove_single_skiplist(_active_list, key, commit_sequence);
 	if (res) {
 		_active_bytes += key.size() + EMPTY_VALUE.size() + SEQ_AND_VALTYPE_SIZE;
-		if (_active_bytes > _max_active_bytes) { froze_with_active_unique(); }
-		return true;
+		if (_active_bytes > _max_active_bytes) {
+			std::pair<std::uint64_t, std::uint64_t> remove_res =
+				froze_with_active_unique();
+			return RemoveResult(true, remove_res.first, remove_res.second);
+		} else {
+			return RemoveResult(true);
+		}
 	} else {
-		return false;
+		return RemoveResult(false);
 	}
 }
 
-bool MemTable::froze_with_active_unique() {
+/**
+<frozen_list_id, new_active_list_id>
+*/
+std::pair<std::uint64_t, std::uint64_t> MemTable::froze_with_active_unique() {
+	if (_active_id == std::numeric_limits<std::uint64_t>::max()) {
+		throw std::runtime_error("run out of active_id");
+	}
 	std::unique_lock<std::shared_mutex> frozen_unique(_frozen_mutex);
 	_frozen_lists.push_back(_active_list);
+	_frozen_ids.push_back(_active_id);
+	_active_id++;
 	_frozen_bytes += _active_bytes;
 	_active_bytes = 0;
 	_active_list = std::make_shared<SkipList>(_comparator);
-	return true;
+	return std::make_pair(_frozen_ids.back(), _active_id);
 }
 
 /**
@@ -146,13 +200,40 @@ bool MemTable::put_batch(std::vector<std::pair<std::string, std::string>> kvs,
 						 std::vector<std::uint64_t> commit_sequences) {
 	std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
 	for (int i = 0; i < kvs.size(); i++) {
-		put_single_skiplist(_active_list, kvs[i].first, kvs[i].second,
-							commit_sequences[i]);
-		_active_bytes +=
-			kvs[i].first.size() + kvs[i].second.size() + SEQ_AND_VALTYPE_SIZE;
+		std::string key = kvs[i].first, value = kvs[i].second;
+		std::uint64_t commit_sequence = commit_sequences[i];
+		std::optional<std::string> value_opt = get_precise_single_skiplist(
+			_active_list, key, commit_sequence, ValueType::Value);
+		bool res =
+			put_single_skiplist(_active_list, key, value, commit_sequence);
+		if (res) {
+			// res == true: 添加
+			// 更新 active_bytes
+			_active_bytes += key.size() + value.size() + SEQ_AND_VALTYPE_SIZE;
+			if (_active_bytes > _max_active_bytes) {
+				froze_with_active_unique();
+			}
+		} else {
+			// res == false: 更新
+			// 理论上正常情况好像走不到这里, 走的都是添加的逻辑
+			// 这种情况下find_it一定不是nullptr
+			int old_value_bytes = value_opt.value().size(),
+				cur_size = value.size();
+			_active_bytes += (cur_size - old_value_bytes);
+			if (_active_bytes > _max_active_bytes) {
+				froze_with_active_unique();
+			}
+		}
 	}
-	if (_active_bytes > _max_active_bytes) { froze_with_active_unique(); }
 	return true;
+}
+
+void MemTable::put_entry_data(const std::string &enc_key,
+							  const std::string &value) {
+	std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
+	_active_bytes += enc_key.size() + value.size();
+	put_single_skiplist(_active_list, enc_key, value);
+	if (_active_bytes > _max_active_bytes) { froze_with_active_unique(); }
 }
 
 /**
@@ -512,41 +593,66 @@ HeapIterator MemTable::iter_monotony_predicate(
 	return heap_it;
 }
 
-std::shared_ptr<SST>
+MemTable::FlushLastResult
 MemTable::flush_last(SSTBuilder &builder, const std::string &sst_path,
 					 std::uint64_t sst_id,
 					 std::vector<std::uint64_t> &flushed_seqs) {
+	std::optional<std::uint64_t> flush_id = std::nullopt,
+								 new_active_id = std::nullopt;
+
 	std::shared_ptr<const SkipList> last_list;
+	int flag = 0;
+
 	{
 		std::unique_lock<std::shared_mutex> frozen_unique(_frozen_mutex);
-		if (!_frozen_lists.empty()) {
-			last_list = _frozen_lists.front();
+		while (!_frozen_lists.empty() && _frozen_lists.front()->empty()) {
 			_frozen_lists.pop_front();
-			_frozen_bytes -= last_list->get_byte_size();
+			_frozen_ids.pop_front();
+		}
+	}
+
+	{
+		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
+		if (!_frozen_lists.empty()) {
+			flag = 1;
+			last_list = _frozen_lists.front();
+			// _frozen_lists.pop_front();
+			flush_id = _frozen_ids.front();
+			// _frozen_ids.pop_front();
+			// _frozen_bytes -= last_list->get_byte_size();
 		}
 	}
 	// std::shared_ptr 重载了与 nullptr
 	// 的比较（operator==(std::nullptr_t)，C++11 起），last_list
 	// == nullptr 判断的就是"这个 shared_ptr 当前是否持有指针"
-	if (last_list == nullptr) {
-		std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
-		std::unique_lock<std::shared_mutex> frozen_unique(_frozen_mutex);
-		if (!_frozen_lists.empty()) {
-			last_list = _frozen_lists.front();
-			_frozen_lists.pop_front();
-			_frozen_bytes -= last_list->get_byte_size();
-		} else {
-			if (!_active_list->empty()) {
-				last_list = _active_list;
-				_active_bytes = 0;
-				_active_list = std::make_shared<SkipList>(_comparator);
+	{
+		std::shared_lock<std::shared_mutex> active_shared(_active_mutex);
+		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
+		if (last_list == nullptr) {
+			if (!_frozen_lists.empty()) {
+				flag = 1;
+				last_list = _frozen_lists.front();
+				// _frozen_lists.pop_front();
+				flush_id = _frozen_ids.front();
+				// _frozen_ids.pop_front();
+				// _frozen_bytes -= last_list->get_byte_size();
+			} else {
+				if (!_active_list->empty()) {
+					flag = 2;
+					last_list = _active_list;
+					// _active_bytes = 0;
+					// _active_list = std::make_shared<SkipList>(_comparator);
+					flush_id = _active_id;
+					// _active_id++;
+					// new_active_id = _active_id;
+				}
 			}
 		}
 	}
 
 	if (last_list == nullptr) {
 		// 此时说明frozen和active中都没有数据, 返回空
-		return nullptr;
+		return FlushLastResult(nullptr, std::nullopt, std::nullopt);
 	}
 
 	for (auto it = last_list->begin(); it != last_list->end(); ++it) {
@@ -556,7 +662,25 @@ MemTable::flush_last(SSTBuilder &builder, const std::string &sst_path,
 					InternalKey::decode(enc_key)._value_type);
 		flushed_seqs.push_back(InternalKey::decode(enc_key)._commit_sequence);
 	}
-	return builder.build(sst_id, sst_path);
+	std::shared_ptr<SST> sst = builder.build(sst_id, sst_path);
+	if (sst != nullptr) {
+		if (flag == 1) {
+			std::unique_lock<std::shared_mutex> frozen_unique(_frozen_mutex);
+			_frozen_lists.pop_front();
+			_frozen_ids.pop_front();
+			_frozen_bytes -= last_list->get_byte_size();
+		} else if (flag == 2) {
+			std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
+			if (_active_id == std::numeric_limits<std::uint64_t>::max()) {
+				throw std::runtime_error("run out of active_id");
+			}
+			_active_bytes = 0;
+			_active_list = std::make_shared<SkipList>(_comparator);
+			_active_id++;
+			new_active_id = _active_id;
+		}
+	}
+	return FlushLastResult(sst, flush_id, new_active_id);
 }
 
 std::size_t MemTable::get_total_size() {
@@ -572,4 +696,29 @@ void MemTable::clear() {
 	_active_bytes = 0;
 	_frozen_lists.clear();
 	_frozen_bytes = 0;
+	_frozen_ids.clear();
+	_active_id = 0;
 }
+
+
+MemTable::PutResult::PutResult(bool is_add)
+	: _is_add(is_add), _frozen_list_id(std::nullopt),
+	  _new_active_list_id(std::nullopt) {}
+MemTable::PutResult::PutResult(bool is_add, std::uint64_t frozen_list_id,
+							   std::uint64_t new_active_list_id)
+	: _is_add(is_add), _frozen_list_id(frozen_list_id),
+	  _new_active_list_id(new_active_list_id) {}
+
+MemTable::RemoveResult::RemoveResult(bool is_success)
+	: _is_success(is_success), _frozen_list_id(std::nullopt),
+	  _new_active_list_id(std::nullopt) {}
+MemTable::RemoveResult::RemoveResult(bool is_success,
+									 std::uint64_t frozen_list_id,
+									 std::uint64_t new_active_list_id)
+	: _is_success(is_success), _frozen_list_id(frozen_list_id),
+	  _new_active_list_id(new_active_list_id) {}
+
+MemTable::FlushLastResult::FlushLastResult(
+	std::shared_ptr<SST> sst, std::optional<std::uint64_t> flush_id,
+	std::optional<std::uint64_t> new_active_id)
+	: _sst(sst), _flush_id(flush_id), _new_active_id(new_active_id) {}

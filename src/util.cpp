@@ -1,11 +1,15 @@
 #include "util.h"
 #include "log.h"
 #include <algorithm>
+#include <asm-generic/errno-base.h>
+#include <cerrno>
 #include <cstddef>
 #include <fcntl.h>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string.h>
+#include <string>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -80,10 +84,76 @@ FileObj FileObj::create_and_write(const std::string &path,
 	if (fd == -1) {
 		LOG(Log::ERROR) << "file: " << path
 						<< " open failed, errno: " << strerror(errno);
-		return FileObj(path, -1);
+		throw std::runtime_error("file: " + path + " open failed");
 	}
-	ssize_t write_size = ::write(fd, data.data(), data.size());
+	FileObj file(path, fd);
+	ssize_t write_size = 0, cur_write_size = 0;
+	while (write_size < data.size()) {
+		cur_write_size =
+			::write(fd, data.data() + write_size, data.size() - write_size);
+		if (cur_write_size == -1) {
+			if (errno == EINTR) {
+				continue;
+			} else {
+				throw std::runtime_error("file: " + path + " write failed");
+			}
+		} else if (cur_write_size > 0) {
+			write_size += cur_write_size;
+		} else {
+			// cur_write_size == 0
+			throw std::runtime_error("file: " + path + " write failed");
+		}
+	}
+	if (!file.fsync()) {
+		throw std::runtime_error("file: " + path + " fsync failed");
+	}
+	return file;
+}
+
+FileObj FileObj::create_rw(const std::string &path) {
+	int fd = ::open(path.c_str(), O_CREAT | O_RDWR, 0644);
 	return FileObj(path, fd);
+}
+
+FileObj FileObj::open_rw(const std::string &path) {
+	int fd = ::open(path.c_str(), O_RDWR);
+	return FileObj(path, fd);
+}
+
+bool FileObj::atomic_write(const std::string &file_path,
+						   const std::vector<std::uint8_t> &data) {
+	FileObj::create_and_write(file_path + ".tmp", data);
+	std::filesystem::rename(file_path + ".tmp", file_path);
+	std::string parent_path = std::filesystem::path(file_path).parent_path();
+	int fd = ::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY);
+	if (fd == -1) {
+		throw std::runtime_error(std::string("data_dir open failed, errno: ") +
+								 strerror(errno));
+	}
+	int res = ::fsync(fd);
+	if (res == -1) {
+		::close(fd);
+		throw std::runtime_error(std::string("data_dir fsync failed, errno: ") +
+								 strerror(errno));
+	}
+	if (fd != -1) { ::close(fd); }
+	return true;
+}
+
+void FileObj::fsync_parent_path(const std::string &file_path) {
+	std::string parent_path = std::filesystem::path(file_path).parent_path();
+	int fd = ::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY);
+	if (fd == -1) {
+		throw std::runtime_error("parent dir: " + parent_path +
+								 " open failed, errno: " + strerror(errno));
+	}
+	int res = ::fsync(fd);
+	if (res == -1) {
+		::close(fd);
+		throw std::runtime_error(std::string("data_dir fsync failed, errno: ") +
+								 strerror(errno));
+	}
+	if (fd != -1) { ::close(fd); }
 }
 
 std::vector<std::uint8_t> FileObj::read(std::size_t offset,
@@ -93,6 +163,30 @@ std::vector<std::uint8_t> FileObj::read(std::size_t offset,
 	off_t off = ::lseek(_fd, offset, SEEK_SET);
 	ssize_t read_bytes = ::read(_fd, buf, length);
 	if (read_bytes == -1) {
+		LOG(Log::ERROR) << "read file: " << _path
+						<< " failed, errno: " << strerror(errno);
+		throw std::runtime_error("read file failed.");
+	} else if (read_bytes == 0) {
+		return std::vector<std::uint8_t>();
+	}
+	return std::vector<uint8_t>(buf, buf + read_bytes);
+}
+
+std::vector<std::uint8_t> FileObj::read_continue(std::size_t length) const {
+	char buf[length];
+	::memset(buf, 0, length);
+	ssize_t read_bytes = 0, cur_read_bytes = 0;
+	while (read_bytes < length) {
+		cur_read_bytes = ::read(_fd, buf + read_bytes, length - read_bytes);
+		if (cur_read_bytes > 0) {
+			read_bytes += cur_read_bytes;
+		} else if (cur_read_bytes == -1 && errno == EINTR) {
+			continue;
+		} else {
+			break;
+		}
+	}
+	if (cur_read_bytes == -1) {
 		LOG(Log::ERROR) << "read file: " << _path
 						<< " failed, errno: " << strerror(errno);
 		throw std::runtime_error("read file failed.");
@@ -169,13 +263,52 @@ std::vector<std::uint8_t> FileObj::get_bytes_of_uint64(std::uint64_t n) {
 
 bool FileObj::append_data(std::vector<std::uint8_t> data) {
 	::lseek(_fd, 0, SEEK_END);
-	ssize_t write_size = ::write(_fd, data.data(), data.size());
-	if (write_size == -1) {
-		LOG(Log::ERROR) << "write file: " << _path
-						<< " failed, errno: " << strerror(errno);
+
+	ssize_t write_size = 0;
+	while (write_size < data.size()) {
+		ssize_t cur =
+			::write(_fd, data.data() + write_size, data.size() - write_size);
+		if (cur == -1) {
+			if (errno == EINTR) {
+				continue;
+			} else {
+				LOG(Log::ERROR)
+					<< "file write failed, fd: " << std::to_string(_fd);
+				break;
+			}
+		} else if (cur == 0) {
+			LOG(Log::ERROR) << "file write failed, fd: " << std::to_string(_fd);
+			break;
+		} else {
+			write_size += cur;
+		}
 	}
-	return write_size != -1;
+	return write_size == data.size();
 }
+
+bool FileObj::clear() {
+	int res = ::ftruncate(_fd, 0);
+	if (res == 0) {
+		return true;
+	} else {
+		LOG(Log::ERROR) << "clear file: " << _path
+						<< "failed, errno: " << strerror(errno);
+		return false;
+	}
+}
+
+bool FileObj::fsync() {
+	int res = ::fsync(_fd);
+	if (res == 0) {
+		return true;
+	} else {
+		LOG(Log::ERROR) << "fsync file: " << _path
+						<< "failed, errno: " << strerror(errno);
+		return false;
+	}
+}
+
+bool FileObj::seek_begin() { return ::lseek(_fd, 0, SEEK_SET) != -1; }
 
 bool FileObj::close() {
 	int res = ::close(_fd);
@@ -184,11 +317,16 @@ bool FileObj::close() {
 						<< " failed, errno: " << strerror(errno);
 		return false;
 	}
+	_fd = -1;
 	return true;
 }
 std::size_t FileObj::size() const {
 	struct stat buf;
-	::fstat(_fd, &buf);
+	int res = ::fstat(_fd, &buf);
+	if (res == -1) {
+		throw std::runtime_error("file fd: " + std::to_string(_fd) +
+								 " fstat failed, errno: " + strerror(errno));
+	}
 	return buf.st_size;
 }
 bool FileObj::is_valid() const { return _fd != -1; }

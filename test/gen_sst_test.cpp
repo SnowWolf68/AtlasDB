@@ -39,7 +39,7 @@ std::shared_ptr<BaseIterator> make_mem_iter(
 	std::vector<std::tuple<std::string, std::string, std::uint64_t>> kvs) {
 	MemTable table;
 	for (auto &[key, value, seq] : kvs) {
-		CHECK(table.put(key, value, seq));
+		CHECK(table.put(key, value, seq)._is_add);
 	}
 	return std::make_shared<HeapIterator>(
 		std::move(table.begin(std::nullopt, true)));
