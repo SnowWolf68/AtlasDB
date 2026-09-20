@@ -27,6 +27,23 @@ std::string prefix;
 int remaining = 0;
 int writes = 0;
 int syncs = 0;
+std::string watched_directory;
+int directory_syncs = 0;
+bool fail_directory_sync = false;
+
+void arm_directory_sync(const std::string &dir, bool fail) {
+    watched_directory = dir;
+    directory_syncs = 0;
+    fail_directory_sync = fail;
+}
+
+bool is_watched_directory(int fd) {
+    if (watched_directory.empty()) return false;
+    char path[4096];
+    const auto link = "/proc/self/fd/" + std::to_string(fd);
+    const auto n = ::readlink(link.c_str(), path, sizeof(path));
+    return n > 0 && std::string(path, static_cast<std::size_t>(n)) == watched_directory;
+}
 
 bool is_wal(int fd) {
     if (prefix.empty()) return false;
@@ -66,6 +83,9 @@ void reset() {
     mode = Mode::None;
     exit_dir.clear();
     exit_nth = 0;
+    watched_directory.clear();
+    directory_syncs = 0;
+    fail_directory_sync = false;
 }
 } // namespace fault
 extern "C" ssize_t __real_write(int, const void *, size_t);
@@ -94,6 +114,14 @@ extern "C" ssize_t __wrap_write(int fd, const void *data, size_t size) {
     return __real_write(fd, data, size);
 }
 extern "C" int __wrap_fsync(int fd) {
+    if (fault::is_watched_directory(fd)) {
+        ++fault::directory_syncs;
+        if (fault::fail_directory_sync) {
+            fault::fail_directory_sync = false;
+            errno = EIO;
+            return -1;
+        }
+    }
     if (fault::is_exit_target(fd) && ++fault::exits_seen == fault::exit_nth) {
         ::_exit(0); // simulate power loss at this durability point
     }
@@ -619,18 +647,29 @@ void test_manifest_bootstrap_migration() {
         LSMEngine db(dir.path, 1024 * 1024, 1024, 100);
         CHECK(db.put("legacy", "v") == 1);
         CHECK(db.flush() == 1);
+        CHECK(db.put("legacy-2", "v2") == 2);
+        CHECK(db.flush() == 2);
     }
     CHECK(std::filesystem::exists(manifest_path));
     std::filesystem::remove(manifest_path); // simulate a pre-manifest version
     {
         LSMEngine db(dir.path);
         CHECK(db.get("legacy")._value == "v");
-        CHECK(db.put("next", "v2").has_value());
+        CHECK(db.get("legacy-2")._value == "v2");
+        // Stay read-only: a write would make close() flush and replace the
+        // bootstrap manifest, hiding encoding or line-separator errors.
     }
     CHECK(std::filesystem::exists(manifest_path)); // bootstrap rewrote it
     {
         LSMEngine db(dir.path);
         CHECK(db.get("legacy")._value == "v");
+        CHECK(db.get("legacy-2")._value == "v2");
+        CHECK(db.put("next", "v2").has_value());
+    }
+    {
+        LSMEngine db(dir.path);
+        CHECK(db.get("legacy")._value == "v");
+        CHECK(db.get("legacy-2")._value == "v2");
         CHECK(db.get("next")._value == "v2");
     }
 }
@@ -679,7 +718,7 @@ void test_manifest_corrupt_line_rejects_open() {
         CHECK(db.flush() == 1);
     }
     FileObj::atomic_write(dir.path + "/manifest.txt",
-                          {'g', 'a', 'r', 'b', 'a', 'g', 'e', '\n'});
+                          std::vector<std::uint8_t>{'g', 'a', 'r', 'b', 'a', 'g', 'e', '\n'});
     bool rejected = false;
     try {
         LSMEngine db(dir.path);
@@ -732,7 +771,7 @@ void test_manifest_corrupt_sst_rejects_open() {
         sst_path = find_first_sst(dir.path);
     }
     CHECK(!sst_path.empty());
-    FileObj::atomic_write(sst_path, {'g', 'a', 'r', 'b', 'a', 'g', 'e'});
+    FileObj::atomic_write(sst_path, std::vector<std::uint8_t>{'g', 'a', 'r', 'b', 'a', 'g', 'e'});
     bool rejected = false;
     try {
         LSMEngine db(dir.path);
@@ -774,6 +813,52 @@ void test_compact_delete_failure_continues() {
 }
 
 #ifdef ATLASDB_WAL_FAULT_INJECTION
+void test_reopen_wal_directory_sync(bool fail_sync) {
+    TempDir dir;
+    {
+        LSMEngine db(dir.path);
+        CHECK(db.put("existing", "value").has_value());
+    }
+    // Both metadata files already exist, so reopening cannot incidentally
+    // sync the directory while creating seq.txt or bootstrapping manifest.
+    CHECK(std::filesystem::exists(dir.path + "/seq.txt"));
+    CHECK(std::filesystem::exists(dir.path + "/manifest.txt"));
+    const auto previous_ids = wal_ids(dir.path);
+    CHECK(!previous_ids.empty());
+    fault::arm_directory_sync(dir.path, fail_sync);
+    bool rejected = false;
+    try {
+        LSMEngine db(dir.path);
+        CHECK(!fail_sync);
+        CHECK(fault::directory_syncs > 0);
+        const auto current_ids = wal_ids(dir.path);
+        CHECK(!current_ids.empty());
+        CHECK(current_ids.back() > previous_ids.back());
+        CHECK(db.get("existing")._value == "value");
+        CHECK(db.put("after-reopen", "new-value").has_value());
+        // Only observe startup and the first write, never close()'s flush.
+        fault::watched_directory.clear();
+    } catch (const std::runtime_error &e) {
+        // Do not turn failed CHECK assertions or unrelated I/O errors into
+        // an apparently successful fault-injection test.
+        if (!fail_sync || fault::directory_syncs == 0 ||
+            std::string(e.what()).find("fsync failed") == std::string::npos) {
+            throw;
+        }
+        rejected = true;
+    }
+    CHECK(rejected == fail_sync);
+    fault::reset();
+    // A failed directory sync must propagate out of open; a later retry
+    // must still recover the preexisting data and accept writes.
+    LSMEngine reopened(dir.path);
+    CHECK(reopened.get("existing")._value == "value");
+    if (!fail_sync) {
+        CHECK(reopened.get("after-reopen")._value == "new-value");
+    }
+    CHECK(reopened.put("retry", "ok").has_value());
+}
+
 void test_batch_failure(fault::Mode mode, bool deleting) {
     TempDir dir;
     LSMEngine db(dir.path, 1024 * 1024, 1024, 100);
@@ -925,6 +1010,8 @@ int main() {
         {"manifest corrupt sst rejects open", test_manifest_corrupt_sst_rejects_open},
         {"compact delete failure continues", test_compact_delete_failure_continues},
 #ifdef ATLASDB_WAL_FAULT_INJECTION
+        {"reopened WAL syncs directory before writes", [] { test_reopen_wal_directory_sync(false); }},
+        {"reopened WAL directory sync failure rejects open", [] { test_reopen_wal_directory_sync(true); }},
         {"atomic publish crash leaves complete file", test_atomic_publish_crash_leaves_complete_file},
         {"manifest publish crash preserves data", test_manifest_publish_crash_preserves_data},
 #endif

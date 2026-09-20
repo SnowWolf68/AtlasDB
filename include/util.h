@@ -61,6 +61,8 @@ public:
 
 	static bool atomic_write(const std::string &file_path,
 							 const std::vector<std::uint8_t> &data);
+	static bool atomic_write(const std::string &file_path,
+							 const std::string &str);
 	static void fsync_parent_path(const std::string &file_path);
 
 	std::vector<std::uint8_t> read(std::size_t offset,

@@ -140,6 +140,12 @@ bool FileObj::atomic_write(const std::string &file_path,
 	return true;
 }
 
+bool FileObj::atomic_write(const std::string &file_path,
+						   const std::string &str) {
+	std::vector<std::uint8_t> data(str.begin(), str.end());
+	return atomic_write(file_path, data);
+}
+
 void FileObj::fsync_parent_path(const std::string &file_path) {
 	std::string parent_path = std::filesystem::path(file_path).parent_path();
 	int fd = ::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY);

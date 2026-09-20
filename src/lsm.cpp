@@ -26,6 +26,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -52,7 +53,7 @@ LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 	if (!std::filesystem::exists(manifest_filepath)) {
 		FileObj manifest_file = FileObj::create_rw(manifest_filepath);
 		// 把磁盘上的sst文件恢复到manifest中
-		std::vector<std::uint8_t> manifest_data;
+		std::stringstream ss;
 		for (auto item : std::filesystem::directory_iterator(_data_dir)) {
 			if (item.is_regular_file()) {
 				std::optional<std::pair<std::size_t, std::size_t>> sst_info =
@@ -64,15 +65,10 @@ LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 				}
 				sst_infos.insert(
 					{sst_info.value().first, sst_info.value().second});
-				std::vector<std::uint8_t> sst_info_bytes =
-					encode_sst_info(sst_info.value());
-				manifest_data.insert(manifest_data.end(),
-									 sst_info_bytes.begin(),
-									 sst_info_bytes.end());
-				manifest_data.push_back('\n');
+				ss << sst_info->first << "," << sst_info->second << "\n";
 			}
 		}
-		FileObj::atomic_write(manifest_filepath, manifest_data);
+		FileObj::atomic_write(manifest_filepath, ss.str());
 	}
 
 	// 读manifest, 找到所有需要恢复的<sst_id, level>集合

@@ -190,12 +190,14 @@ std::uint64_t WAL::load_wal(const std::string &dir, MemTable &memtable) {
 		memtable._frozen_ids.push_back(pr.second);
 	}
 	memtable._active_id = max_id + 1;
-	_file = FileObj::create_rw(get_filepath(dir, memtable._active_id));
+	std::string filepath = get_filepath(dir, memtable._active_id);
+	_file = FileObj::create_rw(filepath);
 	if (!_file.is_valid()) {
 		throw std::runtime_error(
 			"file: " + get_filepath(dir, memtable._active_id) +
 			" create failed");
 	}
+	FileObj::fsync_parent_path(filepath);
 	return max_commit_sequence;
 }
 
