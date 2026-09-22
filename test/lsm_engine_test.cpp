@@ -122,9 +122,9 @@ void test_put_triggers_flush_and_creates_file() {
 		std::size_t prev_files = 0;
 		// 每条约 5+7+8=20B，60 条 ≈ 1200B > 1024 → 触发 flush
 		for (int i = 0; i < 60; i++) {
-			engine.put("key-" + std::to_string(i),
-					   "value-" + std::to_string(i),
-					   static_cast<std::uint64_t>(i + 1));
+			CHECK(engine.put("key-" + std::to_string(i),
+					   "value-" + std::to_string(i))
+					  .has_value());
 			// put 返回语义已改为"成功=本次 seq",不再携带"是否刷盘"信息,
 			// 用 SST 文件数增长判断
 			std::size_t cur_files = count_sst_files(dir);
@@ -151,9 +151,9 @@ void test_flush_content_roundtrip() {
 
 		const int n = 50;
 		for (int i = 0; i < n; i++) {
-			engine.put("key-" + std::to_string(i),
-					   "value-" + std::to_string(i),
-					   static_cast<std::uint64_t>(i + 1));
+			CHECK(engine.put("key-" + std::to_string(i),
+					   "value-" + std::to_string(i))
+					  .has_value());
 		}
 
 		// 显式 flush：active 直刷成 file0，返回值为表内最大 seq
@@ -189,9 +189,9 @@ void test_multiple_flushes_increasing_ids() {
 		std::size_t flush_count = 0;
 		std::size_t prev_files = 0;
 		for (int i = 0; i < 200; i++) {
-			engine.put("key-" + std::to_string(i),
-					   "value-" + std::to_string(i),
-					   static_cast<std::uint64_t>(i + 1));
+			CHECK(engine.put("key-" + std::to_string(i),
+					   "value-" + std::to_string(i))
+					  .has_value());
 			// put 返回语义已改为"成功=本次 seq",不再携带"是否刷盘"信息,
 			// 改用 SST 文件数增长来数刷盘次数(threshold=9999 不触发 compact,文件只增不减)
 			std::size_t cur_files = count_sst_files(dir);
@@ -220,12 +220,11 @@ void test_remove_flushes_tombstone() {
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
 
-		engine.put("victim", "alive", 1);
-		engine.remove("victim", 2);
+		CHECK(engine.put("victim", "alive").has_value());
+		CHECK(engine.remove("victim").has_value());
 		// 填充数据（凑足一块 block 的内容）
 		for (int i = 0; i < 60; i++) {
-			engine.put("pad-" + std::to_string(i), "x",
-					   static_cast<std::uint64_t>(100 + i));
+			CHECK(engine.put("pad-" + std::to_string(i), "x").has_value());
 		}
 
 		// 显式 flush，全部内容落盘到 file0
@@ -260,13 +259,12 @@ void test_put_return_value_semantics() {
 	{
 		// 大阈值引擎：写入不触发 flush
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
-		// 带 seq 版：成功回显传入的 seq
+		// 新库自动分配序号，成功返回本次分配的 seq。
 		for (int i = 0; i < 10; i++) {
-			CHECK(engine.put("k" + std::to_string(i), "v",
-							 static_cast<std::uint64_t>(i + 1)) ==
+			CHECK(engine.put("k" + std::to_string(i), "v") ==
 				  std::optional<std::uint64_t>(i + 1));
 		}
-		// 无 seq 版：分配到的 seq 严格单调递增
+		// 后续写入的 seq 严格单调递增。
 		auto s1 = engine.put("a", "v");
 		auto s2 = engine.put("b", "v");
 		CHECK(s1.has_value() && s2.has_value() && *s2 > *s1);
@@ -292,8 +290,7 @@ void test_put_return_value_semantics() {
 		std::size_t prev_files = 0;
 		for (int i = 0; i < 60 && !flushed; i++) {
 			CHECK(engine.put("key-" + std::to_string(i),
-							 "value-" + std::to_string(i),
-							 static_cast<std::uint64_t>(i + 1)) ==
+							 "value-" + std::to_string(i)) ==
 				  std::optional<std::uint64_t>(i + 1));
 			std::size_t cur_files = count_sst_files(dir);
 			if (cur_files > prev_files) { flushed = true; }
@@ -313,9 +310,9 @@ void test_get_after_flush() {
 
 		const int n = 50;
 		for (int i = 0; i < n; i++) {
-			engine.put("key-" + std::to_string(i),
-					   "value-" + std::to_string(i),
-					   static_cast<std::uint64_t>(i + 1));
+			CHECK(engine.put("key-" + std::to_string(i),
+					   "value-" + std::to_string(i))
+					  .has_value());
 		}
 		CHECK(engine.flush() > 0);
 
@@ -340,12 +337,12 @@ void test_memtable_tombstone_shortcircuit() {
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
 
-		engine.put("victim", "old-value", 1);
+		CHECK(engine.put("victim", "old-value").has_value());
 		CHECK(engine.flush() > 0); // SST 里有 "victim"="old-value"
 
 		// memtable 里写墓碑（不 flush）→ get 必须命中墓碑短路，
 		// 不能穿透到 SST 读回旧值
-		engine.remove("victim", 2);
+		CHECK(engine.remove("victim").has_value());
 		LookUpResult res = engine.get("victim", 100);
 		CHECK(res._value_type == TombStone);
 		CHECK(res._value.empty());
@@ -360,10 +357,10 @@ void test_sst_tombstone_shortcircuit() {
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
 
-		engine.put("victim", "old-value", 1);
+		CHECK(engine.put("victim", "old-value").has_value());
 		CHECK(engine.flush() > 0); // file0: victim@1 Value
 
-		engine.remove("victim", 2);
+		CHECK(engine.remove("victim").has_value());
 		CHECK(engine.flush() > 0); // file1: victim@2 TombStone（更新）
 
 		// L0 = [file1(新), file0(旧)]，先查 file1 命中墓碑 → 短路
@@ -381,8 +378,8 @@ void test_multi_version_seq_filter() {
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
 
-		engine.put("key", "v1", 1);
-		engine.put("key", "v2", 2);
+		CHECK(engine.put("key", "v1").has_value());
+		CHECK(engine.put("key", "v2").has_value());
 		CHECK(engine.flush() > 0); // 两个版本都在 file0
 
 		LookUpResult r1 = engine.get("key", 1);   // 只看 seq<=1 → v1
@@ -407,10 +404,10 @@ void test_restart_recovery() {
 	rm_dir(dir);
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
-		engine.put("a", "1", 1);
-		engine.put("b", "2", 2);
+		CHECK(engine.put("a", "1").has_value());
+		CHECK(engine.put("b", "2").has_value());
 		CHECK(engine.flush() > 0); // file0
-		engine.put("c", "3", 3);
+		CHECK(engine.put("c", "3").has_value());
 		CHECK(engine.flush() > 0); // file1
 	}
 	{
@@ -422,7 +419,7 @@ void test_restart_recovery() {
 		CHECK(engine.get("zzz", 100)._value_type == NotFound);
 
 		// next_sst_id 已恢复为 max+1=2：新 flush 用 id=2，不覆盖旧文件
-		engine.put("d", "4", 4);
+		CHECK(engine.put("d", "4").has_value());
 		CHECK(engine.flush() > 0);
 		CHECK(std::filesystem::exists(engine.get_sst_path(2, 0)));
 		// 旧数据仍在
@@ -481,8 +478,7 @@ void test_multi_block_read() {
 		const std::uint64_t snapshot = 100000; // 快照点大于所有 seq，全部可见
 		for (int i = 0; i < n; i++) {
 			std::string value(90, 'x'); // 90B 的 value
-			engine.put("key-" + std::to_string(i), value,
-					   static_cast<std::uint64_t>(i + 1));
+			CHECK(engine.put("key-" + std::to_string(i), value).has_value());
 		}
 		CHECK(engine.flush() > 0);
 
@@ -509,9 +505,9 @@ void test_get_batch_all_hit() {
 		std::vector<std::string> keys;
 		std::vector<std::uint64_t> seqs;
 		for (int i = 0; i < n; i++) {
-			engine.put("key-" + std::to_string(i),
-					   "value-" + std::to_string(i),
-					   static_cast<std::uint64_t>(i + 1));
+			CHECK(engine.put("key-" + std::to_string(i),
+					   "value-" + std::to_string(i))
+					  .has_value());
 			keys.push_back("key-" + std::to_string(i));
 			seqs.push_back(100);
 		}
@@ -537,10 +533,10 @@ void test_get_batch_mixed() {
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
 
 		// SST 里：sst-key（flush 落盘）
-		engine.put("sst-key", "sst-val", 1);
+		CHECK(engine.put("sst-key", "sst-val").has_value());
 		CHECK(engine.flush() > 0);
 		// memtable 里：mem-key（不 flush）
-		engine.put("mem-key", "mem-val", 2);
+		CHECK(engine.put("mem-key", "mem-val").has_value());
 
 		std::vector<std::string> keys = {"sst-key", "mem-key", "no-key"};
 		std::vector<std::uint64_t> seqs = {100, 100, 100};
@@ -561,9 +557,9 @@ void test_get_batch_tombstone_shortcircuit() {
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
 
-		engine.put("victim", "old", 1);
+		CHECK(engine.put("victim", "old").has_value());
 		CHECK(engine.flush() > 0); // SST 里有旧值
-		engine.remove("victim", 2); // memtable 墓碑（不 flush）
+		CHECK(engine.remove("victim").has_value()); // memtable 墓碑（不 flush）
 
 		std::vector<std::string> keys = {"victim", "other"};
 		std::vector<std::uint64_t> seqs = {100, 100};
@@ -582,12 +578,12 @@ void test_get_batch_consistent_with_get() {
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
 		for (int i = 0; i < 40; i++) {
-			engine.put("k" + std::to_string(i), "v" + std::to_string(i),
-					   static_cast<std::uint64_t>(i + 1));
+			CHECK(engine.put("k" + std::to_string(i), "v" + std::to_string(i))
+					  .has_value());
 		}
 		CHECK(engine.flush() > 0);
-		engine.remove("k5", 50); // 墓碑（memtable）
-		engine.put("k6", "v6-new", 60); // 覆盖旧版本（memtable）
+		CHECK(engine.remove("k5").has_value()); // 墓碑（memtable）
+		CHECK(engine.put("k6", "v6-new").has_value()); // 覆盖旧版本（memtable）
 
 		std::vector<std::string> keys;
 		std::vector<std::uint64_t> seqs;

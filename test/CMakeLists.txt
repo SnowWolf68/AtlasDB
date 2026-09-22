@@ -17,7 +17,15 @@ set(
 	predicate_test
 	facade_test
 	wal_test
+	tran_test
 )
+
+# Linux-only review regressions: the repro pauses a committing transaction at
+# its WAL rotation via --wrap=fsync, which needs GNU ld. Other platforms skip
+# the target entirely.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	list(APPEND ATLASDB_TEST_TARGETS transaction_review_test)
+endif()
 
 foreach(test_target IN LISTS ATLASDB_TEST_TARGETS)
 	add_executable(${test_target} ${test_target}.cpp)
@@ -35,5 +43,7 @@ endforeach()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	target_compile_definitions(wal_test PRIVATE ATLASDB_WAL_FAULT_INJECTION=1)
 	target_link_options(wal_test PRIVATE "-Wl,--wrap=write" "-Wl,--wrap=fsync")
+	target_link_options(transaction_review_test PRIVATE "-Wl,--wrap=fsync")
+	set_tests_properties(transaction_review_test PROPERTIES TIMEOUT 60)
 endif()
 set_tests_properties(wal_test PROPERTIES TIMEOUT 60)

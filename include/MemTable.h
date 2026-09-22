@@ -12,13 +12,12 @@
 #include <shared_mutex>
 #include <string>
 #include <utility>
+static const std::uint64_t MAX_COMMIT_SEQUENCE = ((1ULL << 56) - 1);
 
 class HeapIterator : public BaseIterator {
 	friend class MemTable;
 
 public:
-	static const std::uint64_t MAX_COMMIT_SEQUENCE = ((1ULL << 56) - 1);
-
 	class HeapItem {
 	public:
 		inline static const InternalKeyComparator _comparator;
@@ -110,6 +109,16 @@ public:
 						std::optional<std::uint64_t> new_active_id);
 	};
 
+	class FrozeResult {
+	public:
+		std::optional<std::uint64_t> _frozen_list_id;
+		std::optional<std::uint64_t> _new_active_list_id;
+
+		FrozeResult();
+		FrozeResult(std::uint64_t frozen_list_id,
+					std::uint64_t new_active_list_id);
+	};
+
 	static const std::size_t MAX_ACTIVE_BYTES = 4ULL * 1024 * 1024; // 4MB
 
 	MemTable(std::size_t max_active_bytes = MAX_ACTIVE_BYTES,
@@ -118,11 +127,14 @@ public:
 
 
 	PutResult put(const std::string &key, const std::string &value,
-				  std::uint64_t commit_sequence);
+				  std::uint64_t commit_sequence, bool enable_frozen = true);
 
 	LookUpResult get(const std::string &key, std::uint64_t commit_sequence);
 
-	RemoveResult remove(const std::string &key, std::uint64_t commit_sequence);
+	RemoveResult remove(const std::string &key, std::uint64_t commit_sequence,
+						bool enable_frozen = true);
+
+	FrozeResult froze();
 
 	bool put_batch(std::vector<std::pair<std::string, std::string>> kvs,
 				   std::vector<std::uint64_t> commit_sequences);

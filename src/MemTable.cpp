@@ -85,7 +85,8 @@ false -- 更新
 */
 MemTable::PutResult MemTable::put(const std::string &key,
 								  const std::string &value,
-								  std::uint64_t commit_sequence) {
+								  std::uint64_t commit_sequence,
+								  bool enable_frozen) {
 	std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
 	std::optional<std::string> value_opt = get_precise_single_skiplist(
 		_active_list, key, commit_sequence, ValueType::Value);
@@ -94,7 +95,7 @@ MemTable::PutResult MemTable::put(const std::string &key,
 		// res == true: 添加
 		// 更新 active_bytes
 		_active_bytes += key.size() + value.size() + SEQ_AND_VALTYPE_SIZE;
-		if (_active_bytes > _max_active_bytes) {
+		if (_active_bytes > _max_active_bytes && enable_frozen) {
 			std::pair<std::uint64_t, std::uint64_t> id_pair =
 				froze_with_active_unique();
 			return PutResult(true, id_pair.first, id_pair.second);
@@ -107,7 +108,7 @@ MemTable::PutResult MemTable::put(const std::string &key,
 		// 这种情况下find_it一定不是nullptr
 		int old_value_bytes = value_opt.value().size(), cur_size = value.size();
 		_active_bytes += (cur_size - old_value_bytes);
-		if (_active_bytes > _max_active_bytes) {
+		if (_active_bytes > _max_active_bytes && enable_frozen) {
 			std::pair<std::uint64_t, std::uint64_t> id_pair =
 				froze_with_active_unique();
 			return PutResult(false, id_pair.first, id_pair.second);
@@ -158,12 +159,13 @@ LookUpResult MemTable::get(const std::string &user_key,
 }
 
 MemTable::RemoveResult MemTable::remove(const std::string &key,
-										std::uint64_t commit_sequence) {
+										std::uint64_t commit_sequence,
+										bool enable_frozen) {
 	std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
 	bool res = remove_single_skiplist(_active_list, key, commit_sequence);
 	if (res) {
 		_active_bytes += key.size() + EMPTY_VALUE.size() + SEQ_AND_VALTYPE_SIZE;
-		if (_active_bytes > _max_active_bytes) {
+		if (_active_bytes > _max_active_bytes && enable_frozen) {
 			std::pair<std::uint64_t, std::uint64_t> remove_res =
 				froze_with_active_unique();
 			return RemoveResult(true, remove_res.first, remove_res.second);
@@ -173,6 +175,16 @@ MemTable::RemoveResult MemTable::remove(const std::string &key,
 	} else {
 		return RemoveResult(false);
 	}
+}
+
+MemTable::FrozeResult MemTable::froze() {
+	std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
+	if (_active_bytes > _max_active_bytes) {
+		std::pair<std::uint64_t, std::uint64_t> froze_result =
+			froze_with_active_unique();
+		return FrozeResult(froze_result.first, froze_result.second);
+	}
+	return FrozeResult();
 }
 
 /**
@@ -380,7 +392,7 @@ HeapIterator &HeapIterator::operator++() {
 
 HeapIterator MemTable::begin(std::optional<std::uint64_t> commit_sequence_opt,
 							 bool keep_all_version, bool skip_tombston) const {
-	std::uint64_t commit_sequence = HeapIterator::MAX_COMMIT_SEQUENCE;
+	std::uint64_t commit_sequence = MAX_COMMIT_SEQUENCE;
 	if (commit_sequence_opt != std::nullopt) {
 		commit_sequence = commit_sequence_opt.value();
 	}
@@ -722,3 +734,10 @@ MemTable::FlushLastResult::FlushLastResult(
 	std::shared_ptr<SST> sst, std::optional<std::uint64_t> flush_id,
 	std::optional<std::uint64_t> new_active_id)
 	: _sst(sst), _flush_id(flush_id), _new_active_id(new_active_id) {}
+
+MemTable::FrozeResult::FrozeResult()
+	: _frozen_list_id(std::nullopt), _new_active_list_id(std::nullopt) {}
+MemTable::FrozeResult::FrozeResult(std::uint64_t frozen_list_id,
+								   std::uint64_t new_active_list_id)
+	: _frozen_list_id(frozen_list_id), _new_active_list_id(new_active_list_id) {
+}

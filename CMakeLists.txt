@@ -20,6 +20,7 @@ add_library(
 	src/log.cpp
 	src/lsm.cpp
 	src/sst.cpp
+	src/TranContext.cpp
 	src/util.cpp
 	src/wal.cpp
 )

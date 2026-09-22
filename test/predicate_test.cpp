@@ -93,10 +93,10 @@ std::size_t count_level_files(const std::string &dir, const std::string &ext) {
 
 void test_memtable_only() {
 	auto engine = make_engine("/tmp/predicate_test_memtable_only");
-	engine->put("alpha", "1", 10);
-	engine->put("bravo", "2", 20);
-	engine->put("charlie", "3", 30);
-	engine->put("delta", "4", 40);
+	CHECK(engine->put("alpha", "1").has_value());
+	CHECK(engine->put("bravo", "2").has_value());
+	CHECK(engine->put("charlie", "3").has_value());
+	CHECK(engine->put("delta", "4").has_value());
 
 	auto entries = collect_pred(
 		engine->iter_monotony_predicate(range_pred("bravo", "delta"),
@@ -110,12 +110,12 @@ void test_memtable_only() {
 
 void test_memtable_and_sst() {
 	auto engine = make_engine("/tmp/predicate_test_mem_sst");
-	engine->put("alpha", "a-sst", 1);
-	engine->put("bravo", "b-sst", 2);
-	engine->put("charlie", "c-sst", 3);
+	CHECK(engine->put("alpha", "a-sst").has_value());
+	CHECK(engine->put("bravo", "b-sst").has_value());
+	CHECK(engine->put("charlie", "c-sst").has_value());
 	engine->flush(); // → L0
-	engine->put("delta", "d-mem", 4);
-	engine->put("echo", "e-mem", 5);
+	CHECK(engine->put("delta", "d-mem").has_value());
+	CHECK(engine->put("echo", "e-mem").has_value());
 
 	auto entries = collect_pred(
 		engine->iter_monotony_predicate(range_pred("bravo", "echo"),
@@ -130,8 +130,8 @@ void test_memtable_and_sst() {
 
 void test_no_match() {
 	auto engine = make_engine("/tmp/predicate_test_no_match");
-	engine->put("alpha", "1", 10);
-	engine->put("bravo", "2", 20);
+	CHECK(engine->put("alpha", "1").has_value());
+	CHECK(engine->put("bravo", "2").has_value());
 
 	auto it = engine->iter_monotony_predicate(range_pred("x", "z"),
 											  std::nullopt);
@@ -151,11 +151,11 @@ void test_empty_engine() {
 
 void test_tombstone_suppressed() {
 	auto engine = make_engine("/tmp/predicate_test_tombstone");
-	engine->put("k1", "v1", 1);
-	engine->put("k2", "v2", 2);
-	engine->put("k3", "v3", 3);
+	CHECK(engine->put("k1", "v1").has_value());
+	CHECK(engine->put("k2", "v2").has_value());
+	CHECK(engine->put("k3", "v3").has_value());
 	engine->flush(); // → L0
-	engine->remove("k2", 10); // memtable 墓碑必须压住 SST 的 k2 旧值
+	CHECK(engine->remove("k2").has_value()); // memtable 墓碑必须压住 SST 的 k2 旧值
 
 	auto entries = collect_pred(
 		engine->iter_monotony_predicate(range_pred("k1", "k4"),
@@ -169,11 +169,11 @@ void test_tombstone_suppressed() {
 
 void test_tombstone_at_range_start() {
 	auto engine = make_engine("/tmp/predicate_test_tomb_start");
-	engine->put("a", "va", 1);
-	engine->put("b", "vb", 2);
-	engine->put("c", "vc", 3);
+	CHECK(engine->put("a", "va").has_value());
+	CHECK(engine->put("b", "vb").has_value());
+	CHECK(engine->put("c", "vc").has_value());
 	engine->flush();
-	engine->remove("a", 10); // 范围内最小 key 被删除
+	CHECK(engine->remove("a").has_value()); // 范围内最小 key 被删除
 
 	auto entries = collect_pred(
 		engine->iter_monotony_predicate(range_pred("a", "c"), std::nullopt));
@@ -187,34 +187,36 @@ void test_tombstone_at_range_start() {
 
 void test_snapshot_filter() {
 	auto engine = make_engine("/tmp/predicate_test_snapshot");
-	engine->put("k", "v0", 5);
-	engine->flush(); // SST: k@5
-	engine->put("k", "v1", 50); // memtable: k@50
+	auto old_seq = engine->put("k", "v0");
+	CHECK(old_seq.has_value());
+	engine->flush(); // 旧版本进入 SST。
+	auto new_seq = engine->put("k", "v1"); // 新版本留在 MemTable。
+	CHECK(new_seq && *new_seq > *old_seq);
 
-	// seq=20: 只见 SST 的 v0
-	auto e20 = collect_pred(
+	// 旧版本的实际序号作为快照：只见 SST 的 v0。
+	auto historical = collect_pred(
 		engine->iter_monotony_predicate(range_pred("k", "l"),
-										std::optional<std::uint64_t>(20)));
-	CHECK(e20.size() == 1);
-	CHECK(e20[0].value == "v0" && e20[0].seq == 5);
+										old_seq));
+	CHECK(historical.size() == 1);
+	CHECK(historical[0].value == "v0" && historical[0].seq == *old_seq);
 
 	// nullopt: 见最新 v1
 	auto elast = collect_pred(
 		engine->iter_monotony_predicate(range_pred("k", "l"), std::nullopt));
 	CHECK(elast.size() == 1);
-	CHECK(elast[0].value == "v1" && elast[0].seq == 50);
+	CHECK(elast[0].value == "v1" && elast[0].seq == *new_seq);
 }
 
 // ─── 8. L0 重叠多表, 跨表最新版本胜 ─────────────────────────────
 
 void test_l0_overlap_newest_wins() {
 	auto engine = make_engine("/tmp/predicate_test_l0_overlap");
-	engine->put("a", "1", 1);
+	CHECK(engine->put("a", "1").has_value());
 	engine->flush(); // L0 表1: a@1
-	engine->put("a", "2", 2);
-	engine->put("b", "1", 3);
-	engine->flush(); // L0 表2: a@2, b@1
-	engine->put("b", "2", 4); // memtable: b@2
+	CHECK(engine->put("a", "2").has_value());
+	CHECK(engine->put("b", "1").has_value());
+	engine->flush(); // L0 表2: a@2, b@3
+	CHECK(engine->put("b", "2").has_value()); // memtable: b@4
 
 	auto entries = collect_pred(
 		engine->iter_monotony_predicate(range_pred("a", "c"), std::nullopt));
@@ -236,7 +238,7 @@ void test_l1_binary_search() {
 		for (int i = 0; i < 20; i++) {
 			int n = round * 20 + i;
 			std::string key = "k" + std::to_string(100 + n); // k100..k159
-			engine->put(key, std::string(180, 'v'), n + 1);
+			CHECK(engine->put(key, std::string(180, 'v')).has_value());
 		}
 		engine->flush();
 	}
@@ -275,18 +277,18 @@ void test_reconcile_with_scan() {
 	auto engine = make_engine("/tmp/predicate_test_reconcile");
 	// 混合状态: 两轮 flush + 多版本 + 墓碑 + memtable 尾巴
 	for (int i = 0; i < 8; i++) {
-		engine->put("key" + std::to_string(i), "v1-" + std::to_string(i),
-					i + 1);
+		CHECK(engine->put("key" + std::to_string(i), "v1-" + std::to_string(i))
+				  .has_value());
 	}
 	engine->flush();
 	for (int i = 4; i < 12; i++) {
-		engine->put("key" + std::to_string(i), "v2-" + std::to_string(i),
-					i + 21);
+		CHECK(engine->put("key" + std::to_string(i), "v2-" + std::to_string(i))
+				  .has_value());
 	}
 	engine->flush();
-	engine->remove("key6", 100);
-	engine->put("key12", "v3-12", 101);
-	engine->put("key3", "v3-3", 102);
+	CHECK(engine->remove("key6").has_value());
+	CHECK(engine->put("key12", "v3-12").has_value());
+	CHECK(engine->put("key3", "v3-3").has_value());
 
 	auto pred = range_pred("key2", "key9");
 	std::vector<Entry> expected;
@@ -316,9 +318,9 @@ void test_reconcile_with_scan() {
 
 void test_gap_predicate() {
 	auto engine = make_engine("/tmp/predicate_test_gap");
-	engine->put("a", "1", 1);
-	engine->put("c", "3", 3);
-	engine->put("e", "5", 5);
+	CHECK(engine->put("a", "1").has_value());
+	CHECK(engine->put("c", "3").has_value());
+	CHECK(engine->put("e", "5").has_value());
 
 	// [b, d): 命中的只有 c
 	auto entries = collect_pred(

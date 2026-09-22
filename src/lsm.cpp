@@ -4,6 +4,7 @@
 #include "Comparator.h"
 #include "MemTable.h"
 #include "Record.h"
+#include "TranContext.h"
 #include "log.h"
 #include "sst.h"
 #include "util.h"
@@ -37,6 +38,9 @@
 #include <utility>
 #include <vector>
 
+
+CommitResult::CommitResult(Status status, std::optional<std::uint64_t> seq)
+	: status(status), commit_seq(seq) {}
 
 LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 					 std::size_t max_active_size, std::size_t compact_threshold,
@@ -144,14 +148,13 @@ LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 	if (std::filesystem::exists(_com_seq_filepath)) {
 		FileObj seq_file = FileObj::open_read(_com_seq_filepath);
 		std::uint64_t commit_sequence = seq_file.read_uint64(0);
-		commit_sequence =
-			std::max(commit_sequence, wal_max_commit_sequence + 1);
+		commit_sequence = std::max(commit_sequence, wal_max_commit_sequence);
 		_commit_sequence.store(commit_sequence);
 	} else {
-		std::uint64_t init_seq = 1;
+		std::uint64_t init_seq = 0;
 		std::vector<std::uint8_t> data = get_bytes_of_uint64t(init_seq);
 		FileObj::atomic_write(_com_seq_filepath, data);
-		_commit_sequence.store(std::max(1UL, wal_max_commit_sequence + 1));
+		_commit_sequence.store(std::max(0UL, wal_max_commit_sequence));
 	}
 }
 
@@ -221,8 +224,8 @@ std::uint64_t LSMEngine::flush() {
 	SSTBuilder builder;
 	std::vector<std::uint64_t> flushed_seqs;
 	std::size_t cur_sst_id;
-	std::unique_lock<std::shared_mutex> unique(_ssts_mutex);
 	std::lock_guard<std::mutex> wal_write_mutex(_wal_write_mutex);
+	std::unique_lock<std::shared_mutex> unique(_ssts_mutex);
 
 	std::vector<std::uint8_t> data =
 		get_bytes_of_uint64t(_commit_sequence.load());
@@ -279,14 +282,16 @@ std::uint64_t LSMEngine::flush() {
 		max_commit_sequence: 本次写的 seq / 整批 max
 */
 std::optional<std::uint64_t> LSMEngine::put(const std::string &key,
-											const std::string &value,
-											std::uint64_t commit_sequence) {
+											const std::string &value) {
 	// return apply_insert(key, value, commit_sequence, ValueType::Value);
+	if (value.size() > Block::MAX_VALUE_LEN - 1) { return std::nullopt; }
 	std::optional<std::uint64_t> res = std::nullopt;
 	{
 		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
 		std::shared_lock<std::shared_mutex> shared(_close_mutex);
+		std::uint64_t commit_sequence = _commit_sequence.load() + 1;
 		res = apply_insert(key, value, commit_sequence, ValueType::Value);
+		_commit_sequence.fetch_add(1);
 	}
 	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
 	return res;
@@ -340,98 +345,20 @@ LSMEngine::apply_insert(const std::string &key, const std::string &value,
 		nullopt = 引擎已关闭拒绝
 		max_commit_sequence: 本次写的 seq / 整批 max
 */
-std::optional<std::uint64_t> LSMEngine::remove(const std::string &key,
-											   std::uint64_t commit_sequence) {
+std::optional<std::uint64_t> LSMEngine::remove(const std::string &key) {
 	// return apply_insert(key, "", commit_sequence, ValueType::TombStone);
 	std::optional<std::uint64_t> res = std::nullopt;
 	{
 		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
 		std::shared_lock<std::shared_mutex> shared(_close_mutex);
+		std::uint64_t commit_sequence = _commit_sequence.load() + 1;
 		res = apply_insert(key, "", commit_sequence, ValueType::TombStone);
+		_commit_sequence.fetch_add(1);
 	}
 	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
 	return res;
 }
 
-/**
-	-- return:
-		空批: 当前水位
-		nullopt = 引擎已关闭拒绝
-		max_commit_sequence: 本次写的 seq / 整批 max
-*/
-std::vector<std::optional<std::uint64_t>>
-LSMEngine::put_batch(std::vector<std::pair<std::string, std::string>> kvs,
-					 std::vector<std::uint64_t> commit_sequences) {
-	if (kvs.size() != commit_sequences.size()) {
-		return std::vector<std::optional<std::uint64_t>>();
-	}
-	std::vector<std::optional<std::uint64_t>> res =
-		std::vector<std::optional<std::uint64_t>>(kvs.size(), std::nullopt);
-	{
-		{
-			std::lock_guard<std::mutex> lguard(_wal_write_mutex);
-			std::shared_lock<std::shared_mutex> shared(_close_mutex);
-			for (std::size_t i = 0; i < kvs.size(); i++) {
-				res[i] = apply_insert(kvs[i].first, kvs[i].second,
-									  commit_sequences[i], ValueType::Value);
-				if (res[i] == std::nullopt) { break; }
-			}
-		}
-	}
-	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
-	return res;
-}
-
-/**
-	-- return:
-		空批: 当前水位
-		nullopt = 引擎已关闭拒绝
-		max_commit_sequence: 本次写的 seq / 整批 max
-*/
-std::vector<std::optional<std::uint64_t>>
-LSMEngine::remove_batch(std::vector<std::string> ks,
-						std::vector<std::uint64_t> commit_sequences) {
-	if (ks.size() != commit_sequences.size()) {
-		return std::vector<std::optional<std::uint64_t>>();
-	}
-	std::vector<std::optional<std::uint64_t>> res =
-		std::vector<std::optional<std::uint64_t>>(ks.size(), std::nullopt);
-	{
-		{
-			std::lock_guard<std::mutex> lguard(_wal_write_mutex);
-			std::shared_lock<std::shared_mutex> shared(_close_mutex);
-			for (std::size_t i = 0; i < ks.size(); i++) {
-				res[i] = apply_insert(ks[i], "", commit_sequences[i],
-									  ValueType::TombStone);
-				if (res[i] == std::nullopt) { break; }
-			}
-		}
-	}
-	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
-	return res;
-}
-/**
-	-- return:
-		空批: 当前水位
-		nullopt = 引擎已关闭拒绝
-		max_commit_sequence: 本次写的 seq / 整批 max
-*/
-std::optional<std::uint64_t> LSMEngine::put(const std::string &key,
-											const std::string &value) {
-	if (value.size() > Block::MAX_VALUE_LEN - 1) { return std::nullopt; }
-	std::uint64_t commit_sequence = _commit_sequence.fetch_add(1);
-	return put(key, value, commit_sequence);
-}
-/**
-	-- return:
-		空批: 当前水位
-		nullopt = 引擎已关闭拒绝
-		max_commit_sequence: 本次写的 seq / 整批 max
-*/
-std::optional<std::uint64_t> LSMEngine::remove(const std::string &key) {
-	std::uint64_t commit_sequence = _commit_sequence.fetch_add(1);
-	return remove(key, commit_sequence);
-}
 /**
 	-- return:
 		空批: 当前水位
@@ -445,12 +372,25 @@ LSMEngine::put_batch(std::vector<std::pair<std::string, std::string>> kvs) {
 			return std::vector<std::optional<std::uint64_t>>();
 		}
 	}
-	std::vector<std::uint64_t> seqs;
-	for (std::size_t i = 0; i < kvs.size(); i++) {
-		seqs.push_back(_commit_sequence.fetch_add(1));
+	std::vector<std::optional<std::uint64_t>> res =
+		std::vector<std::optional<std::uint64_t>>(kvs.size(), std::nullopt);
+	{
+		{
+			std::lock_guard<std::mutex> lguard(_wal_write_mutex);
+			std::shared_lock<std::shared_mutex> shared(_close_mutex);
+			for (std::size_t i = 0; i < kvs.size(); i++) {
+				std::uint64_t commit_sequence = _commit_sequence.load() + 1;
+				res[i] = apply_insert(kvs[i].first, kvs[i].second,
+									  commit_sequence, ValueType::Value);
+				_commit_sequence.fetch_add(1);
+				if (res[i] == std::nullopt) { break; }
+			}
+		}
 	}
-	return put_batch(kvs, seqs);
+	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
+	return res;
 }
+
 /**
 	-- return:
 		空批: 当前水位
@@ -459,11 +399,23 @@ LSMEngine::put_batch(std::vector<std::pair<std::string, std::string>> kvs) {
 */
 std::vector<std::optional<std::uint64_t>>
 LSMEngine::remove_batch(std::vector<std::string> ks) {
-	std::vector<std::uint64_t> seqs;
-	for (std::size_t i = 0; i < ks.size(); i++) {
-		seqs.push_back(_commit_sequence.fetch_add(1));
+	std::vector<std::optional<std::uint64_t>> res =
+		std::vector<std::optional<std::uint64_t>>(ks.size(), std::nullopt);
+	{
+		{
+			std::lock_guard<std::mutex> lguard(_wal_write_mutex);
+			std::shared_lock<std::shared_mutex> shared(_close_mutex);
+			for (std::size_t i = 0; i < ks.size(); i++) {
+				std::uint64_t commit_sequence = _commit_sequence.load() + 1;
+				res[i] = apply_insert(ks[i], "", commit_sequence,
+									  ValueType::TombStone);
+				_commit_sequence.fetch_add(1);
+				if (res[i] == std::nullopt) { break; }
+			}
+		}
 	}
-	return remove_batch(ks, seqs);
+	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
+	return res;
 }
 
 /**
@@ -578,10 +530,7 @@ LookUpResult LSMEngine::get(const std::string &key) {
 }
 std::vector<LookUpResult>
 LSMEngine::get_batch(const std::vector<std::string> &keys) {
-	std::vector<std::uint64_t> seqs;
-	for (std::size_t i = 0; i < keys.size(); i++) {
-		seqs.push_back(_commit_sequence.load());
-	}
+	std::vector<std::uint64_t> seqs(keys.size(), _commit_sequence.load());
 	return get_batch(keys, seqs);
 }
 
@@ -664,7 +613,7 @@ HeapIterator LSMEngine::iter_monotony_predicate(
 	};
 	HeapIterator heap_it = _memtable.iter_monotony_predicate(
 		predicate,
-		commit_sequence == std::nullopt ? HeapIterator::MAX_COMMIT_SEQUENCE
+		commit_sequence == std::nullopt ? MAX_COMMIT_SEQUENCE
 										: commit_sequence.value(),
 		false, true);
 	std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
@@ -727,6 +676,128 @@ HeapIterator LSMEngine::range(const std::string &start_user_key,
 		else return 1;
 	};
 	return iter_monotony_predicate(predicate, _commit_sequence.load());
+}
+
+CommitResult LSMEngine::commit(
+	std::unordered_map<std::string, std::optional<std::string>> map,
+	IsolationLevel level, std::uint64_t snapshot_seq) {
+	std::optional<std::uint64_t> commit_sequence = std::nullopt;
+	{ // 不同的commit之间需要互斥, 因此需要加锁
+		// 并且当前的commit也要和其他的单独的写互斥,
+		// 也就是和单独的put/remove也要互斥
+		// 因此可以考虑也使用wal_write_mutex这把锁,
+		// 因为这里commit的时候也需要先写wal, 然后再put到memtable中
+
+		// 并且这里由于事务的原子性, 因此wal的记录也需要以事务为单位,
+		// 这样恢复的时候如果发现某一个事务里的操作不完整, 就放弃恢复,
+		// 这样就能保证不会出现一个事务恢复了一半的情况出现
+
+		// 在这里先加锁然后再取号sequence
+		// 写wal的时候也要把sequence传递过去, 因为这里的map中的key是user_key,
+		// 没有commit_sequence
+		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
+		std::shared_lock<std::shared_mutex> close_shared(_close_mutex);
+		if (_wal_error) {
+			return CommitResult(CommitResult::Status::Closed, std::nullopt);
+		}
+		if (_close) {
+			return CommitResult(CommitResult::Status::Closed, std::nullopt);
+		}
+		commit_sequence = _commit_sequence.load() + 1;
+
+		// 先查是否RR冲突, 然后再写wal
+		// RC: 不验, RR: 每个key查当前已提交的版本, 如果出现seq>我的版本,
+		// 中止事务
+		if (level == IsolationLevel::ReadRepeated) {
+			for (auto &[user_key, value] : map) {
+				LookUpResult get_res = get(user_key, MAX_COMMIT_SEQUENCE);
+				if (get_res.is_found() &&
+					get_res._commit_sequence > snapshot_seq) {
+					return CommitResult(CommitResult::Status::Conflict,
+										std::nullopt);
+				}
+			}
+		}
+
+		// 把这一整个事务的记录先全都放到wal里
+		bool wal_append_res =
+			_wal.append(WAL::encode_transaction(map, commit_sequence.value()));
+		if (!wal_append_res) {
+			_wal_error = true;
+			return CommitResult(CommitResult::Status::Closed, std::nullopt);
+		}
+
+		for (auto &[user_key, value] : map) {
+			ValueType value_type = value == std::nullopt ? TombStone : Value;
+			std::string enc_key = InternalKey::encode(
+				InternalKey(user_key, commit_sequence.value(), value_type));
+			if (value_type == ValueType::Value) {
+				// put
+				_memtable.put(user_key, value.value(), commit_sequence.value(),
+							  false);
+			} else {
+				// remove
+				_memtable.remove(user_key, commit_sequence.value(), false);
+			}
+		}
+		MemTable::FrozeResult froze_result = _memtable.froze();
+		std::optional<std::uint64_t> frozen_list_id =
+			froze_result._frozen_list_id;
+		std::optional<std::uint64_t> new_active_id =
+			froze_result._new_active_list_id;
+		if (frozen_list_id != std::nullopt) {
+			// 发生了froze
+			_wal.fsync();
+			_wal.close();
+			try {
+				_wal = WAL(_data_dir, new_active_id.value());
+			} catch (const std::exception &e) { _wal_error = true; }
+		}
+		_commit_sequence.fetch_add(1);
+	}
+	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
+	if (commit_sequence == std::nullopt) {
+		return CommitResult(CommitResult::Status::Conflict, commit_sequence);
+	} else {
+		return CommitResult(CommitResult::Status::Committed,
+							commit_sequence.value());
+	}
+}
+
+std::shared_ptr<TranContext>
+LSMEngine::begin_transaction(IsolationLevel level) {
+	// 这里的snapshot_sequence应该是_commit_sequence.load() - 1
+	// 因为这里snapshot的意思就是说当前数据库里最新的版本是多少,
+	// load()之后是下一个要分配的号, 当前最新的号就是load() - 1
+
+	// 除此之外, 这里也需要对wal_write_mutex加锁
+	// 因为这里snapshot = x的含义就是说当前所有序号小于等于x的事务都已经做完了
+	// 那么如果此时不对wal加锁,
+	// 那么有可能还有另外一个事务正在commit中还没执行完,
+	// 但是另外的这个事务已经取号了 那么这样的话就会导致本来应该看到的数据
+	// (另外一个已经取号的事务) 在当前这个事务下看不到
+	// 后续如果另外的这个事务提交了, 那么这个数据在当前事务下就能看到了
+	// 从一开始看不到, 到后来能看到, 如果当前是在RR的隔离级别,
+	// 那显然就违反了RR的规则 因此这里需要对wal_write_mutex加锁
+
+	// 但是之类不需要加close锁, 也不需要判断close,
+	// 因为事务最后提交的commit的时候会进行判断
+
+	// 不止这里需要先加锁再取号, 其他put的地方也需要先加锁再put
+	// 因为如果其他地方先取号再加锁, 那么可能取完号,
+	// 没加锁之前其他的事务加锁获取了当前最新的序号, 并开始了事务
+	// 那么这个事务一开始就看不到这个put的结果, 后面如果这个put加锁成功写入完成,
+	// 后面这个事务就又能看到这个数据了
+	// 因此其他的put写入以及其他的类似接口也都需要先加锁再取号,
+	// 并且需要一直持有锁直到数据写入
+
+	std::lock_guard<std::mutex> lguard(_wal_write_mutex);
+	std::uint64_t snapshot_seq = _commit_sequence.load();
+
+	std::shared_ptr<TranContext> ptr(
+		new TranContext(shared_from_this(), snapshot_seq, level));
+
+	return ptr;
 }
 
 /**
@@ -1322,5 +1393,8 @@ HeapIterator LSM::range(const std::string &start_user_key,
 LSMEngineIterator LSM::begin() { return _engine->begin(); }
 LSMEngineIterator LSM::end() { return _engine->end(); }
 std::uint64_t LSM::flush() { return _engine->flush(); }
+std::shared_ptr<TranContext> LSM::begin_transaction(IsolationLevel level) {
+	return _engine->begin_transaction(level);
+}
 void LSM::close() { _engine->close(); }
 LSM::~LSM() {}

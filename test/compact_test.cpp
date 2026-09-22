@@ -337,19 +337,19 @@ void test_compact_triggered() {
 
 	// 第 1 轮：flush 后 L0 = 1（<2，不触发）
 	for (int i = 0; i < 100; i++) {
-		engine.put("k" + std::to_string(i), std::string(1024, 'a'), i + 1);
+		CHECK(engine.put("k" + std::to_string(i), std::string(1024, 'a')).has_value());
 	}
 	engine.flush();
 	// 第 2 轮：flush 后 L0 = 2 → 触发 compact → L0 清空、压到 L1
 	for (int i = 0; i < 100; i++) {
-		engine.put("k" + std::to_string(100 + i), std::string(1024, 'b'),
-				   1000 + i);
+		CHECK(engine.put("k" + std::to_string(100 + i), std::string(1024, 'b'))
+				  .has_value());
 	}
 	engine.flush();
 	// 第 3 轮：又一张 L0（=1，不触发）
 	for (int i = 0; i < 100; i++) {
-		engine.put("k" + std::to_string(200 + i), std::string(1024, 'c'),
-				   2000 + i);
+		CHECK(engine.put("k" + std::to_string(200 + i), std::string(1024, 'c'))
+				  .has_value());
 	}
 	engine.flush();
 
@@ -382,12 +382,12 @@ void test_compact_cascade() {
 	LSMEngine engine(dir, 64 * 1024 * 1024, 4 * 1024 * 1024, 2, 25 * 1024);
 
 	for (int i = 0; i < 100; i++) {
-		engine.put("k" + std::to_string(i), std::string(1024, 'a'), i + 1);
+		CHECK(engine.put("k" + std::to_string(i), std::string(1024, 'a')).has_value());
 	}
 	engine.flush(); // L0 = 1
 	for (int i = 0; i < 100; i++) {
-		engine.put("k" + std::to_string(100 + i), std::string(1024, 'b'),
-				   1000 + i);
+		CHECK(engine.put("k" + std::to_string(100 + i), std::string(1024, 'b'))
+				  .has_value());
 	}
 	engine.flush(); // L0 = 2 → compact → 级联
 

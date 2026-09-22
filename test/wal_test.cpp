@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -187,7 +188,8 @@ void write_segment(const std::string &dir, std::uint64_t id,
 }
 std::vector<std::uint8_t> record(const std::string &key, const std::string &value,
                                std::uint64_t seq, ValueType type = Value) {
-    return WAL::encode(InternalKey::encode(InternalKey(key, seq, type)), value);
+    return WAL::encode_transaction(
+        InternalKey::encode(InternalKey(key, seq, type)), value);
 }
 void wait_child(pid_t pid) {
     int status = 0;
@@ -394,10 +396,12 @@ void test_watermarks() {
             LSMEngine db(dir.path);
             CHECK(db.get("value")._value == "v");
             CHECK(db.get("deleted")._value_type == TombStone);
-            CHECK(db.put("next", "v") == std::max(stored, std::uint64_t{91}));
+        // seq.txt stores the published watermark: the recovered level is
+        // max(stored, wal max seq 90), and the first write uses level+1.
+            CHECK(db.put("next", "v") == std::max(stored, std::uint64_t{90}) + 1);
         }
         LSMEngine reopened(dir.path);
-        CHECK(reopened.put("again", "v") == std::max(stored, std::uint64_t{91}) + 1);
+        CHECK(reopened.put("again", "v") == std::max(stored, std::uint64_t{90}) + 2);
     }
     TempDir empty;
     LSMEngine db(empty.path);
@@ -557,7 +561,9 @@ void test_concurrent_flush_keeps_watermark_monotonic() {
     {
         FileObj f = FileObj::open_read(dir.path + "/seq.txt");
         CHECK(f.size() == 8);
-        CHECK(f.read_uint64(0) > max_seq);
+        // seq.txt stores the published watermark: with every write confirmed
+        // and the engine quiesced it equals the maximum confirmed seq.
+        CHECK(f.read_uint64(0) == max_seq);
         f.close();
     }
     {
@@ -984,6 +990,47 @@ void test_manifest_publish_crash_preserves_data() {
     }
 }
 #endif
+
+// FileObj::read used to place the whole segment in a stack buffer; a WAL
+// larger than the thread stack crashed recovery with SIGSEGV. Open a ~12 MiB
+// valid segment under an explicit 8 MiB stack limit in a forked child (same
+// shape as the original crash, isolated from this process).
+void test_large_wal_reopens_within_default_stack() {
+    TempDir dir;
+    const std::string big(60000, 'x');
+    std::vector<std::uint8_t> bytes;
+    std::uint64_t seq = 0;
+    while (bytes.size() < 12 * 1024 * 1024) {
+        const auto rec = record("bulk-" + std::to_string(seq), big, seq + 1);
+        bytes.insert(bytes.end(), rec.begin(), rec.end());
+        seq++;
+    }
+    write_segment(dir.path, 1, bytes);
+    const auto pid = ::fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct rlimit lim;
+        if (::getrlimit(RLIMIT_STACK, &lim) != 0) ::_exit(3);
+        lim.rlim_cur = lim.rlim_max > 8 * 1024 * 1024
+                           ? static_cast<rlim_t>(8 * 1024 * 1024)
+                           : lim.rlim_max;
+        if (::setrlimit(RLIMIT_STACK, &lim) != 0) ::_exit(3);
+        try {
+            LSMEngine db(dir.path);
+            CHECK(db.get("bulk-0")._value == big);
+            CHECK(db.get("bulk-5")._value == big);
+            CHECK(db.put("next", "v") == seq + 1);
+            ::_exit(0);
+        } catch (const std::exception &e) {
+            std::cerr << "child: " << e.what() << '\n';
+            ::_exit(1);
+        }
+    }
+    wait_child(pid);
+    LSMEngine db(dir.path);
+    CHECK(db.get("bulk-0")._value == big);
+    CHECK(db.put("after", "v") == seq + 2);
+}
 } // namespace
 
 int main() {
@@ -994,6 +1041,7 @@ int main() {
         {"concurrent batches recover across freezes", test_concurrent_batches_recover_across_freezes},
         {"unordered WAL generations and byte accounting", test_unordered_segments_and_byte_accounting},
         {"every truncated final-record boundary", test_every_truncated_tail_boundary},
+        {"large WAL reopens within default stack", test_large_wal_reopens_within_default_stack},
         {"bad final CRC rejects recovery", test_bad_final_crc_rejects_recovery},
         {"missing/stale/ahead watermark and tombstone maximum", test_watermarks},
         {"put/remove generation results and clear IDs", test_memtable_generation_results_and_clear},

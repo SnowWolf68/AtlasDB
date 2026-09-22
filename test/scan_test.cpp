@@ -63,9 +63,9 @@ std::shared_ptr<LSMEngine> make_engine(const std::string &dir) {
 // 1. 基本有序遍历（仅 memtable, 不 flush）：按 user_key 升序输出
 void test_basic_ordered() {
 	auto engine = make_engine("/tmp/scan_test_basic");
-	engine->put("b", "vb", 2);
-	engine->put("a", "va", 1);
-	engine->put("c", "vc", 3);
+	CHECK(engine->put("b", "vb").has_value());
+	CHECK(engine->put("a", "va").has_value());
+	CHECK(engine->put("c", "vc").has_value());
 
 	auto entries = collect(engine->begin(std::nullopt, false), engine->end());
 	CHECK(entries.size() == 3);
@@ -77,10 +77,10 @@ void test_basic_ordered() {
 // 2. 跨源去重：同 key 在 memtable（新）和 L0（旧）, 只输出最新版本
 void test_cross_source_dedup() {
 	auto engine = make_engine("/tmp/scan_test_dedup");
-	engine->put("k", "v1", 1);
-	engine->put("a", "va", 2);
+	CHECK(engine->put("k", "v1").has_value());
+	CHECK(engine->put("a", "va").has_value());
 	engine->flush(); // k@1, a@2 → L0
-	engine->put("k", "v2", 3); // k@3(新) → memtable
+	CHECK(engine->put("k", "v2").has_value()); // k@3(新) → memtable
 
 	auto entries = collect(engine->begin(std::nullopt, false), engine->end());
 	CHECK(entries.size() == 2);
@@ -92,10 +92,10 @@ void test_cross_source_dedup() {
 // 3. 跨源墓碑抑制：墓碑在 memtable、活值在 L0, k 完全消失
 void test_tombstone_suppressed() {
 	auto engine = make_engine("/tmp/scan_test_tombstone");
-	engine->put("k", "v1", 1);
-	engine->put("a", "va", 2);
+	CHECK(engine->put("k", "v1").has_value());
+	CHECK(engine->put("a", "va").has_value());
 	engine->flush(); // k@1, a@2 → L0
-	engine->remove("k", 3); // k@3 墓碑 → memtable
+	CHECK(engine->remove("k").has_value()); // k@3 墓碑 → memtable
 
 	auto entries = collect(engine->begin(std::nullopt, false), engine->end());
 	CHECK(entries.size() == 1); // 只有 a, k 整 key 消失
@@ -105,8 +105,8 @@ void test_tombstone_suppressed() {
 // 4. keep_all=true：同 key 多版本全输出（seq 降序）
 void test_keep_all_versions() {
 	auto engine = make_engine("/tmp/scan_test_keepall");
-	engine->put("k", "v1", 1);
-	engine->put("k", "v2", 2);
+	CHECK(engine->put("k", "v1").has_value());
+	CHECK(engine->put("k", "v2").has_value());
 
 	auto entries =
 		collect(engine->begin(std::nullopt, true, false), engine->end());
@@ -120,16 +120,17 @@ void test_keep_all_versions() {
 // 5. 快照：begin(seq) 只看到 seq ≤ 快照点的版本
 void test_snapshot() {
 	auto engine = make_engine("/tmp/scan_test_snapshot");
-	engine->put("k", "v1", 10);
-	engine->put("k", "v2", 20);
+	auto old_seq = engine->put("k", "v1");
+	auto new_seq = engine->put("k", "v2");
+	CHECK(old_seq && new_seq && *new_seq > *old_seq);
 
-	// 快照 15：k@20 不可见, 只剩 k@10
+	// 以旧版本的实际返回序号建立快照：旧值可见，新值不可见。
 	auto entries =
-		collect(engine->begin(std::optional<std::uint64_t>(15), false),
+		collect(engine->begin(old_seq, false),
 				engine->end());
 	CHECK(entries.size() == 1);
 	CHECK(entries[0].key == "k" && entries[0].value == "v1" &&
-		  entries[0].seq == 10);
+		  entries[0].seq == *old_seq);
 }
 
 // 6. 空库：begin == end, 遍历零条
@@ -141,8 +142,8 @@ void test_empty_engine() {
 // 7. 遍历完后 it == end（扫描循环退出条件）
 void test_end_after_exhaustion() {
 	auto engine = make_engine("/tmp/scan_test_exhausted");
-	engine->put("a", "va", 1);
-	engine->put("b", "vb", 2);
+	CHECK(engine->put("a", "va").has_value());
+	CHECK(engine->put("b", "vb").has_value());
 
 	auto it = engine->begin(std::nullopt, false);
 	auto end = engine->end();
@@ -158,10 +159,10 @@ void test_end_after_exhaustion() {
 // 8. 与 get() 对账：扫描结果 = 逐 key get(最新快照) 按序排
 void test_consistent_with_get() {
 	auto engine = make_engine("/tmp/scan_test_consistency");
-	engine->put("b", "vb", 1);
-	engine->put("a", "va", 2);
+	CHECK(engine->put("b", "vb").has_value());
+	CHECK(engine->put("a", "va").has_value());
 	engine->flush(); // a@2, b@1 → L0
-	engine->put("b", "vb2", 3); // b@3(新) → memtable
+	CHECK(engine->put("b", "vb2").has_value()); // b@3(新) → memtable
 
 	auto entries = collect(engine->begin(std::nullopt, false), engine->end());
 	CHECK(entries.size() == 2);

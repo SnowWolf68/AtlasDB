@@ -22,6 +22,19 @@ class ConcatIterator;
 class TwoMergeIterator;
 class LSMEngineIterator;
 class LSM;
+class TranContext;
+
+class CommitResult {
+public:
+	enum Status { Committed, Conflict, Closed };
+
+	CommitResult(Status status, std::optional<std::uint64_t> seq);
+
+	Status status;
+	std::optional<std::uint64_t> commit_seq;
+};
+
+enum IsolationLevel { ReadCommited, ReadRepeated };
 
 class LSMEngine : public std::enable_shared_from_this<LSMEngine> {
 	inline static const std::string DEFAULT_COM_SEQ_FILENAME = "seq.txt";
@@ -52,18 +65,6 @@ public:
 	并把新 SST 登记进引擎索引
 	*/
 	std::uint64_t flush();
-
-	std::optional<std::uint64_t> put(const std::string &key,
-									 const std::string &value,
-									 std::uint64_t commit_sequence);
-	std::optional<std::uint64_t> remove(const std::string &key,
-										std::uint64_t commit_sequence);
-	std::vector<std::optional<std::uint64_t>>
-	put_batch(std::vector<std::pair<std::string, std::string>> kvs,
-			  std::vector<std::uint64_t> commit_sequences);
-	std::vector<std::optional<std::uint64_t>>
-	remove_batch(std::vector<std::string> ks,
-				 std::vector<std::uint64_t> commit_sequences);
 
 	std::optional<std::uint64_t> put(const std::string &key,
 									 const std::string &value);
@@ -130,6 +131,13 @@ public:
 
 	HeapIterator range(const std::string &start_user_key,
 					   const std::string &end_user_key);
+
+	std::shared_ptr<TranContext> begin_transaction(IsolationLevel level);
+
+	CommitResult
+	commit(std::unordered_map<std::string, std::optional<std::string>> map,
+		   IsolationLevel level, std::uint64_t snapshot_seq);
+
 	void close();
 	~LSMEngine();
 
@@ -274,6 +282,7 @@ public:
 	LSMEngineIterator begin();
 	LSMEngineIterator end();
 	std::uint64_t flush();
+	std::shared_ptr<TranContext> begin_transaction(IsolationLevel level);
 	void close();
 
 	~LSM();

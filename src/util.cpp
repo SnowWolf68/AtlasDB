@@ -164,18 +164,34 @@ void FileObj::fsync_parent_path(const std::string &file_path) {
 
 std::vector<std::uint8_t> FileObj::read(std::size_t offset,
 										std::size_t length) const {
-	char buf[length];
-	::memset(buf, 0, length);
+	// char buf[length];
+	std::vector<std::uint8_t> buf(length);
+	// ::memset(buf, 0, length);
 	off_t off = ::lseek(_fd, offset, SEEK_SET);
-	ssize_t read_bytes = ::read(_fd, buf, length);
-	if (read_bytes == -1) {
-		LOG(Log::ERROR) << "read file: " << _path
-						<< " failed, errno: " << strerror(errno);
-		throw std::runtime_error("read file failed.");
-	} else if (read_bytes == 0) {
-		return std::vector<std::uint8_t>();
+	if (off == -1) {
+		throw std::runtime_error("lseek, fd: " + std::to_string(_fd) +
+								 " , errno: " + strerror(errno));
 	}
-	return std::vector<uint8_t>(buf, buf + read_bytes);
+	ssize_t read_bytes = 0;
+	while (read_bytes < length) {
+		ssize_t cur_size =
+			::read(_fd, buf.data() + read_bytes, length - read_bytes);
+		if (cur_size == -1) {
+			if (errno == EINTR) {
+				continue;
+			} else {
+				throw std::runtime_error(
+					"read failed, fd: " + std::to_string(_fd) +
+					" , errno: " + strerror(errno));
+			}
+		} else if (cur_size == 0) {
+			// 没有数据了
+			break;
+		} else {
+			read_bytes += cur_size;
+		}
+	}
+	return buf;
 }
 
 std::vector<std::uint8_t> FileObj::read_continue(std::size_t length) const {

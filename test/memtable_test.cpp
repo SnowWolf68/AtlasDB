@@ -397,7 +397,7 @@ void test_monotony_predicate_basic() {
 	};
 
 	auto it = table.iter_monotony_predicate(
-		pred, HeapIterator::MAX_COMMIT_SEQUENCE, true, false);
+		pred, MAX_COMMIT_SEQUENCE, true, false);
 	auto item = *it;
 	CHECK(InternalKey::decode(item.first)._key == "bravo");
 	CHECK(item.second == "2");
@@ -422,7 +422,7 @@ void test_monotony_predicate_no_match() {
 	};
 
 	auto it = table.iter_monotony_predicate(
-		pred, HeapIterator::MAX_COMMIT_SEQUENCE, true, false);
+		pred, MAX_COMMIT_SEQUENCE, true, false);
 	CHECK(!(it != table.end()));  // empty
 }
 
@@ -460,7 +460,7 @@ void test_monotony_predicate_all_visible_with_max_seq() {
 
 	// default seq = MAX → all visible
 	auto it = table.iter_monotony_predicate(
-		pred, HeapIterator::MAX_COMMIT_SEQUENCE, true, false);
+		pred, MAX_COMMIT_SEQUENCE, true, false);
 	int count = 0;
 	while (it != table.end()) {
 		++it;
