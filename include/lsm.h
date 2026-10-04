@@ -45,9 +45,12 @@ class LSMEngine : public std::enable_shared_from_this<LSMEngine> {
 	static const std::size_t DEFAULT_MAX_MEMTABLE_SIZE = 64 * 1024 * 1024;
 	static const std::size_t DEFAULT_COMPACT_THRESHOLD = 4;
 	static const std::size_t DEFAULT_L0_SST_SIZE = 4 * 1024 * 1024;
-	static const std::size_t MAX_KEY_LEN = 65535 - 8;
 
 public:
+	static const std::size_t MAX_KEY_LEN = 65535 - 8;
+
+	enum class DelResult { Success, NotFound, Error };
+
 	LSMEngine(const std::string &data_dir,
 			  std::size_t max_memtable_size = DEFAULT_MAX_MEMTABLE_SIZE,
 			  std::size_t max_active_size = MemTable::MAX_ACTIVE_BYTES,
@@ -69,6 +72,7 @@ public:
 	std::optional<std::uint64_t> put(const std::string &key,
 									 const std::string &value);
 	std::optional<std::uint64_t> remove(const std::string &key);
+	LSMEngine::DelResult del(const std::string &key);
 	std::vector<std::optional<std::uint64_t>>
 	put_batch(std::vector<std::pair<std::string, std::string>> kvs);
 	std::vector<std::optional<std::uint64_t>>
@@ -267,7 +271,9 @@ private:
 class LSM {
 public:
 	LSM(const std::string &data_dir);
-
+	std::size_t get_max_key_size();
+	std::size_t get_max_value_size();
+	LSMEngine::DelResult del(const std::string &key);
 	std::optional<std::uint64_t> put(const std::string &key,
 									 const std::string &value);
 	std::optional<std::uint64_t> remove(const std::string &key);

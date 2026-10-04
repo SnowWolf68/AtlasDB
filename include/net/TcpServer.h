@@ -19,7 +19,9 @@ public:
 			  InetAddress server_address,
 			  std::function<void(std::shared_ptr<TcpConnection>, Buffer &)>
 				  server_read_callback,
-			  std::function<void()> stop_finish_callback);
+			  std::function<void()> stop_finish_callback,
+			  std::function<void(std::shared_ptr<TcpConnection>)>
+				  server_close_callback);
 
 	bool start();
 
@@ -50,6 +52,7 @@ private:
 	std::size_t _pending_conn_count;
 	std::function<void()>
 		_stop_finish_callback; // 异步stop停止完成后触发, 上层负责析构server对象
+	std::function<void(std::shared_ptr<TcpConnection>)> _server_close_callback;
 };
 
 #endif // ATLASDB_TCPSERVER_H

@@ -10,7 +10,8 @@ TcpServer::TcpServer(
 	EventLoop *base_loop, std::size_t thread_num, InetAddress server_address,
 	std::function<void(std::shared_ptr<TcpConnection>, Buffer &)>
 		server_read_callback,
-	std::function<void()> stop_finish_callback)
+	std::function<void()> stop_finish_callback,
+	std::function<void(std::shared_ptr<TcpConnection>)> server_close_callback)
 	: _base_loop(base_loop), _thread_num(thread_num),
 	  _server_address(server_address),
 	  _acceptor(std::make_shared<Acceptor>(
@@ -22,7 +23,8 @@ TcpServer::TcpServer(
 	  _thread_pool(base_loop, thread_num), _state(ServerState::Stopped),
 	  _server_read_callback(server_read_callback),
 	  _base_loop_thread_id(std::this_thread::get_id()), _pending_conn_count(0),
-	  _stop_finish_callback(stop_finish_callback) {}
+	  _stop_finish_callback(stop_finish_callback),
+	  _server_close_callback(server_close_callback) {}
 
 void TcpServer::server_close_callback(std::shared_ptr<TcpConnection> conn) {
 	_base_loop->queue_in_loop([this, conn]() {
@@ -40,6 +42,8 @@ void TcpServer::server_close_callback(std::shared_ptr<TcpConnection> conn) {
 				copy();
 			});
 		}
+		// 回调通知上层AtlasServer也删除连接以及对应的Resp
+		_server_close_callback(conn);
 	});
 	DEBUG_LOG << "connection: " << conn->get_peer_address().to_string_ip_port()
 			  << "close";

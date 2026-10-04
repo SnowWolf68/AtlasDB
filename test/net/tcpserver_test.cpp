@@ -131,7 +131,7 @@ void test_unstarted_stop_and_destruction() {
 	InetAddress address;
 	{
 		TcpServer server(&base, 2, InetAddress("127.0.0.1", 0), echo,
-			[&] { ++notifications; });
+			[&] { ++notifications; }, [](Connection) {});
 		address = bound_address;
 		CHECK(server.stop());
 		CHECK(server.stop());
@@ -158,7 +158,7 @@ void empty_stop(std::size_t workers) {
 			CHECK(server->stop());
 			server.reset(); // Callback may release Server, including its callback member.
 			CHECK(base.queue_in_loop([&] { sentinel = true; base.quit(); }));
-		});
+		}, [](Connection) {});
 	CHECK(server->start());
 	CHECK(server->start());
 	CHECK(server->stop());
@@ -177,7 +177,7 @@ void test_wrong_thread_management_rejected() {
 	EventLoop base;
 	int notifications = 0;
 	TcpServer server(&base, 2, InetAddress("127.0.0.1", 0), echo,
-		[&] { ++notifications; base.quit(); });
+		[&] { ++notifications; base.quit(); }, [](Connection) {});
 	const auto address = bound_address;
 	auto before = std::async(std::launch::async, [&] {
 		CHECK(!server.start()); CHECK(!server.stop());
@@ -243,7 +243,7 @@ void active_connections(std::size_t workers) {
 			}
 			server.reset();
 			CHECK(base.queue_in_loop([&] { base.quit(); }));
-		});
+		}, [](Connection) {});
 	const auto address = bound_address;
 	CHECK(server->start());
 	auto client = std::async(std::launch::async, [&] {
@@ -276,7 +276,7 @@ void test_peer_eof_then_new_connection() {
 				seen[port] = weak;
 			}));
 			echo(conn, buffer);
-		}, [&] { CHECK(++notifications == 1); base.quit(); });
+		}, [&] { CHECK(++notifications == 1); base.quit(); }, [](Connection) {});
 	const auto address = bound_address;
 	CHECK(server.start());
 	auto client = std::async(std::launch::async, [&] {
@@ -314,7 +314,7 @@ void test_external_reference_survives_stop() {
 			CHECK(retained && worker_token.expired());
 			stopped.set_value();
 			base.quit();
-		});
+		}, [](Connection) {});
 	const auto address = bound_address;
 	CHECK(server.start());
 	auto client = std::async(std::launch::async, [&] {
@@ -348,7 +348,7 @@ void test_stop_requested_by_worker_callback() {
 			if (!requested.exchange(true)) {
 				CHECK(base.queue_in_loop([&] { CHECK(server_ptr->stop()); }));
 			}
-		}, [&] { CHECK(++notifications == 1); base.quit(); });
+		}, [&] { CHECK(++notifications == 1); base.quit(); }, [](Connection) {});
 	server_ptr = &server;
 	const auto address = bound_address;
 	CHECK(server.start());
@@ -381,7 +381,7 @@ void test_stop_waits_for_inflight_callback() {
 			CHECK(worker_token.expired());
 			CHECK(++notifications == 1);
 			base.quit();
-		});
+		}, [](Connection) {});
 	const auto address = bound_address;
 	CHECK(server.start());
 	auto client = std::async(std::launch::async, [&] {
@@ -424,7 +424,7 @@ void test_restart_inside_finish_callback() {
 				server.reset();
 				base.quit();
 			}
-		});
+		}, [](Connection) {});
 	const auto address = bound_address;
 	CHECK(server->start());
 	auto client = std::async(std::launch::async, [&] {
@@ -453,7 +453,7 @@ void pending_creation_stop(std::size_t workers) {
 			CHECK(++notifications == 1);
 			CHECK(::fcntl(accepted_fd, F_GETFD) == -1 && errno == EBADF);
 			base.quit();
-		});
+		}, [](Connection) {});
 	const auto address = bound_address;
 	CHECK(server.start());
 	// Queue stop before Server queues creation/registration. It executes after
@@ -489,7 +489,7 @@ void test_stale_listener_event_after_stop() {
 			CHECK(++notifications == 1);
 			server.reset();
 			base.quit();
-		});
+		}, [](Connection) {});
 	const auto address = bound_address;
 	const int listen_fd = listener_fd;
 	CHECK(server->start());
@@ -525,6 +525,51 @@ void test_stale_listener_event_after_stop() {
 	after_poll = {};
 	// The peer was never accepted; destroying the listener resets its queued TCP.
 	CHECK(stopped && shared_batch && notifications == 1 && !server);
+}
+
+// Application close notifications must run on base, exactly once, and before
+// stop completion. Cover peer EOF, explicit connection close, and server stop.
+void application_close_notification(int mode) {
+	EventLoop base;
+	const auto owner = std::this_thread::get_id();
+	int closed = 0, finished = 0;
+	std::weak_ptr<TcpConnection> observed;
+	std::promise<void> notified;
+	auto notification = notified.get_future();
+	TcpServer server(&base, 2, InetAddress("127.0.0.1", 0),
+		[&](Connection conn, Buffer &buffer) {
+			if (mode == 1) {
+				CHECK(buffer.erase(buffer.get_readable_size()));
+				conn->close(); conn->close();
+			} else { echo(conn, buffer); }
+		}, [&] {
+			CHECK(closed == 1 && observed.expired());
+			CHECK(++finished == 1);
+			base.quit();
+		}, [&](Connection conn) {
+			CHECK(std::this_thread::get_id() == owner);
+			CHECK(++closed == 1);
+			CHECK(finished == 0);
+			observed = conn;
+			notified.set_value();
+		});
+	const auto address = bound_address;
+	CHECK(server.start());
+	auto client = std::async(std::launch::async, [&] {
+		auto peer = connect_peer(address);
+		if (mode == 1) { send_bytes(peer.fd(), {'x'}); }
+		else {
+			round_trip(peer);
+			if (mode == 0) { CHECK(::shutdown(peer.fd(), SHUT_WR) == 0); }
+			else { CHECK(base.queue_in_loop([&] { CHECK(server.stop()); })); }
+		}
+		await(notification);
+		expect_eof(peer.fd());
+		if (mode != 2) { CHECK(base.queue_in_loop([&] { CHECK(server.stop()); })); }
+	});
+	base.loop();
+	await(client);
+	CHECK(closed == 1 && finished == 1);
 }
 
 struct TestCase { const char *name; void (*run)(); };
@@ -566,6 +611,9 @@ extern "C" int __wrap_epoll_wait(int fd, epoll_event *events, int capacity, int 
 
 int main(int argc, char **argv) {
 	const TestCase tests[] = {
+		{"application notified on EOF", [] { application_close_notification(0); }},
+		{"application notified on explicit close", [] { application_close_notification(1); }},
+		{"application notified before stop finishes", [] { application_close_notification(2); }},
 		{"unstarted stop and destruction", test_unstarted_stop_and_destruction},
 		{"empty stop zero workers", test_empty_stop_zero_workers},
 		{"empty stop multiple workers", test_empty_stop_multiple_workers},

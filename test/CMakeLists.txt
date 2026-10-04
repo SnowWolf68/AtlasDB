@@ -41,11 +41,10 @@ endif()
 
 list(APPEND ATLASDB_TEST_TARGETS ${ATLASDB_NET_TEST_TARGETS})
 
-# Linux-only review regressions: the repro pauses a committing transaction at
-# its WAL rotation via --wrap=fsync, which needs GNU ld. Other platforms skip
-# the target entirely.
+# Linux-only review/integration tests use GNU ld syscall wrapping and /proc
+# for scoped WAL fault injection. Other platforms skip these targets.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-	list(APPEND ATLASDB_TEST_TARGETS transaction_review_test)
+	list(APPEND ATLASDB_TEST_TARGETS transaction_review_test atlasserver_test lsm_del_test)
 endif()
 
 foreach(test_target IN LISTS ATLASDB_TEST_TARGETS)
@@ -74,6 +73,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	target_link_options(tcpserver_test PRIVATE
 		"-Wl,--wrap=bind" "-Wl,--wrap=accept4" "-Wl,--wrap=epoll_wait")
 	set_tests_properties(tcpserver_test PROPERTIES TIMEOUT 120)
+	target_link_options(atlasserver_test PRIVATE
+		"-Wl,--wrap=bind" "-Wl,--wrap=accept4" "-Wl,--wrap=read" "-Wl,--wrap=write")
+	target_link_options(lsm_del_test PRIVATE "-Wl,--wrap=write")
+	set_tests_properties(atlasserver_test PROPERTIES TIMEOUT 300)
+	set_tests_properties(lsm_del_test PROPERTIES TIMEOUT 150)
 endif()
 set_tests_properties(wal_test PROPERTIES TIMEOUT 60)
 set_tests_properties(eventloop_test PROPERTIES TIMEOUT 10)

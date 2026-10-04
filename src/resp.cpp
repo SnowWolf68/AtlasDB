@@ -149,7 +149,6 @@ std::optional<std::string> Resp::encode(RespValue resp_value) {
 }
 
 bool Resp::append(std::string data) {
-	if (data.size() > _max_single_parameter_size) { return false; }
 	if (_buffer.size() + data.size() > _max_buffer_size) { return false; }
 	_buffer.append(data);
 	return true;
@@ -244,6 +243,12 @@ Resp::decode_except_array_without_erase(
 				if (size < 0) {
 					return std::make_pair(
 						DecodeResult::DecodeErr("bulkstring size format error"),
+						std::nullopt);
+				}
+				if (size > _max_single_parameter_size) {
+					return std::make_pair(
+						DecodeResult::DecodeErr(
+							"bulkstring size exceeds max single param size"),
 						std::nullopt);
 				}
 				if (1 + size_str.size() + 2 + size + 2 >

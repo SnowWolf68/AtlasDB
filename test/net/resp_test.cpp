@@ -351,7 +351,7 @@ void test_append_limits() {
 	// 自定义上限:单参数 64 字节 / 总 buffer 256 字节
 	Resp resp(256, 64);
 	CHECK(resp.append(std::string(64, 'a')));
-	CHECK(!resp.append(std::string(65, 'a')));
+	CHECK(resp.append(std::string(65, 'a'))); // chunk size is not parameter size
 
 	// 总量:4×64 恰好填满,第 5 次必须拒绝
 	Resp total(256, 64);
@@ -359,6 +359,34 @@ void test_append_limits() {
 		CHECK(total.append(std::string(64, 'b')));
 	}
 	CHECK(!total.append(std::string(64, 'b')));
+}
+
+void test_bulk_parameter_limit() {
+	const std::string frame = "$64\r\n" + std::string(64, 'x') + "\r\n";
+	Resp resp(256, 64);
+	CHECK(resp.append(frame + frame)); // One append exceeds per-parameter limit.
+	for (int i = 0; i < 2; ++i) {
+		auto result = resp.decode();
+		CHECK(result._state == Resp::DecodeState::Complete);
+		CHECK(result._result_value._bulk_string == std::string(64, 'x'));
+	}
+	CHECK(resp.decode()._state == Resp::DecodeState::NeedMore);
+	for (const auto &prefix : {std::string(), std::string("*1\r\n")}) {
+		Resp too_large(256, 64);
+		CHECK(too_large.append(prefix + "$65\r\n"));
+		CHECK(too_large.decode()._state == Resp::DecodeState::Error);
+	}
+}
+
+void test_append_rejection_preserves_buffer() {
+	Resp resp(16, 8);
+	CHECK(resp.append("$5\r\nhe"));
+	CHECK(!resp.append(std::string(17, 'x')));
+	CHECK(resp.decode()._state == Resp::DecodeState::NeedMore);
+	CHECK(resp.append("llo\r\n"));
+	auto result = resp.decode();
+	CHECK(result._state == Resp::DecodeState::Complete);
+	CHECK(result._result_value._bulk_string == "hello");
 }
 
 // ─── test runner ────────────────────────────────────────────────
@@ -401,6 +429,8 @@ int main() {
 		 test_decode_array_negative_size_rejected},
 		{"decode nested array boundary", test_decode_nested_array_boundary},
 		{"append limits", test_append_limits},
+		{"bulk parameter limit", test_bulk_parameter_limit},
+		{"append rejection preserves buffer", test_append_rejection_preserves_buffer},
 	};
 
 	std::size_t passed = 0;

@@ -359,6 +359,27 @@ std::optional<std::uint64_t> LSMEngine::remove(const std::string &key) {
 	return res;
 }
 
+LSMEngine::DelResult LSMEngine::del(const std::string &key) {
+	if (key.size() > MAX_KEY_LEN) { return DelResult::Error; }
+	LookUpResult get_res{};
+	std::optional<std::uint64_t> res = std::nullopt;
+	{
+		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
+		std::shared_lock<std::shared_mutex> shared(_close_mutex);
+		get_res = get(key);
+		std::uint64_t commit_sequence = _commit_sequence.load() + 1;
+		res = apply_insert(key, "", commit_sequence, ValueType::TombStone);
+		_commit_sequence.fetch_add(1);
+	}
+	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
+	if (res == std::nullopt) { return DelResult::Error; }
+	if ((get_res._value_type == NotFound || get_res._value_type == TombStone) &&
+		res != std::nullopt) {
+		return DelResult::NotFound;
+	}
+	return DelResult::Success;
+}
+
 /**
 	-- return:
 		空批: 当前水位
@@ -1359,6 +1380,11 @@ bool LSMEngineIterator::is_valid() const {
 
 LSM::LSM(const std::string &data_dir)
 	: _engine(std::make_shared<LSMEngine>(data_dir)) {}
+std::size_t LSM::get_max_key_size() { return _engine->MAX_KEY_LEN; }
+std::size_t LSM::get_max_value_size() { return Block::MAX_VALUE_LEN - 1; }
+LSMEngine::DelResult LSM::del(const std::string &key) {
+	return _engine->del(key);
+}
 std::optional<std::uint64_t> LSM::put(const std::string &key,
 									  const std::string &value) {
 	return _engine->put(key, value);
