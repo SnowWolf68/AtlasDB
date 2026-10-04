@@ -21,3 +21,4 @@ logs/
 .vscode/
 
 .zcodeignore
+.idea/

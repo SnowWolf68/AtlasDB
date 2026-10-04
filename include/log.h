@@ -9,6 +9,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#define ERROR_LOG LOG(Log::ERROR)
+#define DEBUG_LOG LOG(Log::DEBUG)
+void log_error(const std::string &message);
+void throw_error(const std::string &message);
 
 class Sink {
 public:

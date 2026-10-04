@@ -1,7 +1,16 @@
 #include "log.h"
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 
+void log_error(const std::string &message) {
+	ERROR_LOG << message << ", errno: " << strerror(errno);
+}
+
+void throw_error(const std::string &message) {
+	log_error(message);
+	throw std::runtime_error(message + " , errno: " + strerror(errno));
+}
 
 Log::Log(std::shared_ptr<Sink> sink, LogSink logsink)
 	: _minimum_log_level(2), _sink(sink), _logsink(logsink) {}
@@ -106,7 +115,8 @@ bool Log::change_log_output_file(std::string filename, std::string filepath) {
 FileSink::FileSink(std::string filename, std::string filepath)
 	: _filename(filename), _filepath(filepath) {
 	std::filesystem::path folder_path(ATLASDB_PROJECT_DIR + _filepath);
-    std::cout << "folder_path: " << std::filesystem::absolute(folder_path) << std::endl;
+	std::cout << "folder_path: " << std::filesystem::absolute(folder_path)
+			  << std::endl;
 	std::error_code err_code;
 	std::filesystem::create_directories(folder_path, err_code);
 	if (err_code) {
