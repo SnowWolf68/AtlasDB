@@ -64,7 +64,7 @@ private:
 
 	// <DecodeResult, erase_size>
 	std::pair<DecodeResult, std::optional<std::size_t>>
-	decode_except_array_without_erase(
+	decode_without_erase(
 		std::optional<std::size_t> start_idx_opt = std::nullopt);
 	static bool check_integer(const std::string &integer_str);
 

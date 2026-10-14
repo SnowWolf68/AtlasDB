@@ -193,13 +193,22 @@ std::uint64_t SST::get_sst_id() const { return _sst_id; }
 
 SSTIterator SST::begin(std::optional<std::uint64_t> commit_sequence,
 					   bool keep_all_version) const {
-	std::shared_ptr<Block> first_block = read_block(0);
-	if (first_block == nullptr) {
-		return SSTIterator(shared_from_this(), num_blocks(),
-						   BlockIterator::invalid_iter());
+
+	int block_idx = 0;
+	SSTIterator sst_iter = SSTIterator::invalid_iter();
+	while (block_idx < _block_metas.size()) {
+		std::shared_ptr<Block> block = read_block(block_idx);
+		if (block == nullptr) {
+			return SSTIterator(shared_from_this(), num_blocks(),
+							   BlockIterator::invalid_iter());
+		}
+		sst_iter = SSTIterator(shared_from_this(), block_idx,
+							   block->begin(commit_sequence, keep_all_version));
+		if (sst_iter.is_valid()) { break; }
+		block_idx++;
 	}
-	return SSTIterator(shared_from_this(), 0,
-					   first_block->begin(commit_sequence, keep_all_version));
+	if (!sst_iter.is_valid()) { sst_iter = end(); }
+	return sst_iter;
 }
 
 SSTIterator SST::end() const {

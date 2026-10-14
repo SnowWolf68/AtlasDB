@@ -573,15 +573,14 @@ ConcatIterator::ConcatIterator(std::vector<std::shared_ptr<SST>> ssts,
 			return;
 		}
 		_sst_iter =
-			_ssts[cur_sst_idx]->begin(_commit_sequence, _keep_all_version);
+			_ssts[_cur_sst_idx]->begin(_commit_sequence, _keep_all_version);
 	}
 }
 
-ConcatIterator
-LSMEngine::level_begin(std::size_t level_idx,
-					   std::optional<std::uint64_t> commit_sequence,
-					   bool keep_all_version) {
-	std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
+ConcatIterator LSMEngine::level_begin_without_lock(
+	std::size_t level_idx, std::optional<std::uint64_t> commit_sequence,
+	bool keep_all_version) {
+	// std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
 	if (_sst_id_map.find(level_idx) == _sst_id_map.end()) {
 		return ConcatIterator(std::vector<std::shared_ptr<SST>>(), 0,
 							  std::nullopt, false);
@@ -602,11 +601,11 @@ ConcatIterator LSMEngine::level_end(std::size_t level_idx) {
 						  _sst_id_map[level_idx].size(), std::nullopt, false);
 }
 
-HeapIterator
-LSMEngine::level_0_begin(std::optional<std::uint64_t> commit_sequence,
-						 bool keep_all_version, bool skip_tombstone) {
+HeapIterator LSMEngine::level_0_begin_without_lock(
+	std::optional<std::uint64_t> commit_sequence, bool keep_all_version,
+	bool skip_tombstone) {
 	HeapIterator heap_it(skip_tombstone, commit_sequence, keep_all_version);
-	std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
+	// std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
 	if (_sst_id_map.find(0) != _sst_id_map.end()) {
 		for (std::size_t l0_id : _sst_id_map[0]) {
 			std::shared_ptr<SST> cur_sst = _ssts[l0_id];
@@ -1238,13 +1237,13 @@ LSMEngineIterator::LSMEngineIterator(
 			continue;
 		}
 		if (level == 0) {
-			HeapIterator heap_it = _engine->level_0_begin(
+			HeapIterator heap_it = _engine->level_0_begin_without_lock(
 				_commit_sequence, _keep_all_version, false);
 			_iters.push_back(
 				std::make_shared<HeapIterator>(std::move(heap_it)));
 		} else {
-			_iters.push_back(
-				std::make_shared<ConcatIterator>(std::move(_engine->level_begin(
+			_iters.push_back(std::make_shared<ConcatIterator>(
+				std::move(_engine->level_begin_without_lock(
 					level, _commit_sequence, _keep_all_version))));
 		}
 	}

@@ -161,7 +161,7 @@ Block::get_kv_at_offset(const std::vector<uint8_t> &data, std::size_t offset) {
 
 std::optional<std::size_t>
 Block::get_idx_by_enc_key(const std::string &enc_key) {
-	std::size_t l = 0, r = _offsets.size() - 1;
+	int l = 0, r = static_cast<int>(_offsets.size()) - 1;
 	while (l <= r) {
 		int mid = (l + r) >> 1;
 		std::pair<std::string, std::string> kv =
@@ -205,7 +205,7 @@ Block::get_value(const std::string &enc_key) {
 	if (data_idx_opt == std::nullopt) {
 		return std::nullopt;
 	} else {
-		return get_kv_at_offset(_data, data_idx_opt.value());
+		return get_kv_at_offset(_data, _offsets[data_idx_opt.value()]);
 	}
 }
 

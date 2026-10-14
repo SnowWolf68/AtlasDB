@@ -625,7 +625,7 @@ void test_concat_iterator_traversal() {
 	}
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
-		auto it = engine.level_begin(1, 100, false);
+		auto it = engine.level_begin_without_lock(1, 100, false);
 		auto end = engine.level_end(1);
 
 		// 非空层 begin != end
@@ -654,7 +654,7 @@ void test_concat_iterator_empty_level() {
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
 		// 不存在的层（5）
-		auto it = engine.level_begin(5, 100, false);
+		auto it = engine.level_begin_without_lock(5, 100, false);
 		auto end = engine.level_end(5);
 		CHECK(it == end); // 空层 begin==end
 		int n = 0;
@@ -682,7 +682,7 @@ void test_concat_iterator_snapshot_and_keepall() {
 
 		// keep_all=false + 快照 25：key-2 只出最新版 v2
 		{
-			auto it = engine.level_begin(1, 25, false);
+			auto it = engine.level_begin_without_lock(1, 25, false);
 			auto end = engine.level_end(1);
 			std::vector<std::pair<std::string, std::string>> got;
 			while (it != end) { auto kv = *it; got.push_back(kv); ++it; }
@@ -692,7 +692,7 @@ void test_concat_iterator_snapshot_and_keepall() {
 		}
 		// keep_all=false + 快照 18：key-2 的可见版本是 v2-old
 		{
-			auto it = engine.level_begin(1, 18, false);
+			auto it = engine.level_begin_without_lock(1, 18, false);
 			auto end = engine.level_end(1);
 			std::vector<std::pair<std::string, std::string>> got;
 			while (it != end) { auto kv = *it; got.push_back(kv); ++it; }
@@ -701,7 +701,7 @@ void test_concat_iterator_snapshot_and_keepall() {
 		}
 		// keep_all=true + 快照 25：key-2 全部版本都出
 		{
-			auto it = engine.level_begin(1, 25, true);
+			auto it = engine.level_begin_without_lock(1, 25, true);
 			auto end = engine.level_end(1);
 			std::vector<std::pair<std::string, std::string>> got;
 			while (it != end) { auto kv = *it; got.push_back(kv); ++it; }
@@ -709,9 +709,50 @@ void test_concat_iterator_snapshot_and_keepall() {
 		}
 		// 快照 5：所有版本都不可见 → begin == end
 		{
-			auto it = engine.level_begin(1, 5, false);
+			auto it = engine.level_begin_without_lock(1, 5, false);
 			auto end = engine.level_end(1);
 			CHECK(it == end);
+		}
+	}
+	rm_dir(dir);
+}
+
+// Leading tables may be completely invisible at a snapshot while later
+// tables still contain visible keys. Check both one and several skipped tables.
+void test_concat_iterator_skips_filtered_leading_tables() {
+	const std::string dir = tmp_dir("concat_filtered_leading_tables");
+	rm_dir(dir);
+	std::filesystem::create_directories(dir);
+	const char *keys[] = {"a", "b", "z"};
+	const std::uint64_t sequences[] = {30, 20, 1};
+	for (std::size_t i = 0; i < 3; ++i) {
+		SSTBuilder builder;
+		CHECK(builder.add(keys[i], keys[i], sequences[i], Value));
+		const std::string id = std::to_string(i + 1);
+		CHECK(builder.build(i + 1, dir + "/sst_" +
+			std::string(32 - id.size(), '0') + id + ".1") != nullptr);
+	}
+	{
+		LSMEngine engine(dir);
+		CHECK(engine.get("z", 10)._value == "z");
+		for (bool keep_all : {false, true}) {
+			// Snapshot 25 skips a; snapshot 10 skips a and b.
+			for (std::uint64_t snapshot : {std::uint64_t{25}, std::uint64_t{10}}) {
+				std::vector<std::string> expected = snapshot == 25
+					? std::vector<std::string>{"b", "z"}
+					: std::vector<std::string>{"z"};
+				auto it = engine.level_begin_without_lock(1, snapshot, keep_all);
+				auto end = engine.level_end(1);
+				for (const auto &key : expected) {
+					CHECK(it.is_valid());
+					CHECK(it != end);
+					CHECK(InternalKey::decode((*it).first)._key == key);
+					CHECK((*it).second == key);
+					++it;
+				}
+				CHECK(!it.is_valid());
+				CHECK(it == end);
+			}
 		}
 	}
 	rm_dir(dir);
@@ -731,7 +772,7 @@ void test_concat_iterator_consistent_with_get() {
 	}
 	{
 		LSMEngine engine(dir, 64 * 1024 * 1024, 1024 * 1024);
-		auto it = engine.level_begin(1, 100, false);
+		auto it = engine.level_begin_without_lock(1, 100, false);
 		auto end = engine.level_end(1);
 		while (it != end) {
 			auto kv = *it;
@@ -802,6 +843,7 @@ int main() {
 		{"test_concat_iterator_traversal", test_concat_iterator_traversal},
 		{"test_concat_iterator_empty_level", test_concat_iterator_empty_level},
 		{"test_concat_iterator_snapshot_and_keepall", test_concat_iterator_snapshot_and_keepall},
+		{"test_concat_iterator_skips_filtered_leading_tables", test_concat_iterator_skips_filtered_leading_tables},
 		{"test_concat_iterator_consistent_with_get", test_concat_iterator_consistent_with_get},
 		{"test_seq_watermark_no_regression_on_reopen", test_seq_watermark_no_regression_on_reopen},
 	};

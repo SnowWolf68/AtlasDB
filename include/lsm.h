@@ -96,11 +96,11 @@ public:
 	LookUpResult get(const std::string &key);
 	std::vector<LookUpResult> get_batch(const std::vector<std::string> &keys);
 
-	ConcatIterator level_begin(std::size_t level_idx,
+	ConcatIterator level_begin_without_lock(std::size_t level_idx,
 							   std::optional<std::uint64_t> commit_sequence,
 							   bool keep_all_version);
 	ConcatIterator level_end(std::size_t level_idx);
-	HeapIterator level_0_begin(std::optional<std::uint64_t> commit_sequence,
+	HeapIterator level_0_begin_without_lock(std::optional<std::uint64_t> commit_sequence,
 							   bool keep_all_version, bool skip_tombstone);
 	HeapIterator level_0_end();
 	std::vector<std::shared_ptr<SST>>

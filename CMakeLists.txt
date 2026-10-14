@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(AtlasDB VERSION 1.0.0 LANGUAGES CXX)
+project(AtlasDB VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(ATLASDB_BUILD_APP "Build the interactive AtlasDB demo" ON)
+option(ATLASDB_BUILD_APP "Build the AtlasDB RESP server" ON)
 
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)

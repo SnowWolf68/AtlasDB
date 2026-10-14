@@ -334,11 +334,107 @@ void test_decode_array_negative_size_rejected() {
 }
 
 void test_decode_nested_array_boundary() {
-	// 已知边界(非缺陷):嵌套数组未支持,元素层的 '*' 解析不了,
-	// 表现为 NeedMore。RESP2 请求方向命令不含嵌套数组。
 	Resp resp;
-	CHECK(resp.append("*1\r\n*1\r\n+OK\r\n\r\n"));
+	CHECK(resp.append("*1\r\n*1\r\n+OK\r\n"));
+	auto result = resp.decode();
+	CHECK(result._state == Resp::DecodeState::Complete);
+	CHECK(result._result_value._value_type == Resp::RespValueType::Arrays);
+	CHECK(result._result_value._array.size() == 1);
+	const auto &inner = result._result_value._array[0];
+	CHECK(inner._value_type == Resp::RespValueType::Arrays);
+	CHECK(inner._array.size() == 1);
+	CHECK(inner._array[0]._value_type == Resp::RespValueType::SimpleString);
+	CHECK(inner._array[0]._simple_string == "OK");
 	CHECK(resp.decode()._state == Resp::DecodeState::NeedMore);
+}
+
+const std::string nested_array_frame =
+	"*4\r\n+HEAD\r\n*3\r\n:1\r\n*0\r\n*1\r\n$3\r\nxyz\r\n+TAIL\r\n$3\r\nEND\r\n";
+
+void check_nested_array_result(const Resp::DecodeResult &result) {
+	CHECK(result._state == Resp::DecodeState::Complete);
+	CHECK(result._result_value._value_type == Resp::RespValueType::Arrays);
+	const auto &outer = result._result_value._array;
+	CHECK(outer.size() == 4);
+	CHECK(outer[0]._value_type == Resp::RespValueType::SimpleString);
+	CHECK(outer[0]._simple_string == "HEAD");
+	CHECK(outer[1]._value_type == Resp::RespValueType::Arrays);
+	const auto &inner = outer[1]._array;
+	CHECK(inner.size() == 3);
+	CHECK(inner[0]._value_type == Resp::RespValueType::Integer);
+	CHECK(inner[0]._integer == 1);
+	CHECK(inner[1]._value_type == Resp::RespValueType::Arrays);
+	CHECK(inner[1]._array.empty());
+	CHECK(inner[2]._value_type == Resp::RespValueType::Arrays);
+	CHECK(inner[2]._array.size() == 1);
+	CHECK(inner[2]._array[0]._value_type == Resp::RespValueType::BulkString);
+	CHECK(inner[2]._array[0]._bulk_string == "xyz");
+	CHECK(outer[2]._value_type == Resp::RespValueType::SimpleString);
+	CHECK(outer[2]._simple_string == "TAIL");
+	CHECK(outer[3]._value_type == Resp::RespValueType::BulkString);
+	CHECK(outer[3]._bulk_string == "END");
+}
+
+void test_decode_nested_array_and_pipeline() {
+	Resp resp;
+	CHECK(resp.append(nested_array_frame + "*1\r\n$4\r\nPING\r\n"));
+	check_nested_array_result(resp.decode());
+	auto next = resp.decode();
+	CHECK(next._state == Resp::DecodeState::Complete);
+	CHECK(next._result_value._value_type == Resp::RespValueType::Arrays);
+	CHECK(next._result_value._array.size() == 1);
+	CHECK(next._result_value._array[0]._value_type == Resp::RespValueType::BulkString);
+	CHECK(next._result_value._array[0]._bulk_string == "PING");
+	CHECK(resp.decode()._state == Resp::DecodeState::NeedMore);
+}
+
+void test_decode_nested_array_byte_stream() {
+	Resp resp;
+	for (std::size_t i = 0; i < nested_array_frame.size(); ++i) {
+		CHECK(resp.append(nested_array_frame.substr(i, 1)));
+		auto result = resp.decode();
+		if (i + 1 < nested_array_frame.size()) {
+			CHECK(result._state == Resp::DecodeState::NeedMore);
+			CHECK(result._result_value._array.empty());
+		} else {
+			check_nested_array_result(result);
+		}
+	}
+	CHECK(resp.decode()._state == Resp::DecodeState::NeedMore);
+}
+
+void test_decode_nested_array_error_atomic() {
+	Resp resp;
+	CHECK(resp.append("*2\r\n+HEAD\r\n*1\r\nX"));
+	auto result = resp.decode();
+	CHECK(result._state == Resp::DecodeState::Error);
+	CHECK(result._result_value._array.empty());
+	CHECK(!result._decode_err_msg.empty());
+	CHECK(resp.append("*1\r\n$4\r\nPING\r\n"));
+	CHECK(resp.decode()._state == Resp::DecodeState::Error);
+}
+
+void test_decode_array_unknown_member_type_rejected() {
+	for (const char *frame : {"*1\r\nX42\r\n", "*2\r\n+OK\r\nX42\r\n"}) {
+		Resp resp;
+		CHECK(resp.append(frame));
+		auto result = resp.decode();
+		CHECK(result._state == Resp::DecodeState::Error);
+		CHECK(!result._decode_err_msg.empty());
+		CHECK(result._result_value._array.empty());
+		// Errors preserve the invalid frame; later commands cannot hide it.
+		CHECK(resp.append("*1\r\n$4\r\nPING\r\n"));
+		CHECK(resp.decode()._state == Resp::DecodeState::Error);
+	}
+}
+
+void test_decode_array_unknown_member_type_streamed() {
+	Resp resp;
+	CHECK(resp.append("*1\r\n"));
+	CHECK(resp.decode()._state == Resp::DecodeState::NeedMore);
+	CHECK(resp.append("X"));
+	// The type byte alone proves invalidity; no CRLF is needed to reject it.
+	CHECK(resp.decode()._state == Resp::DecodeState::Error);
 }
 
 // ─── append 上限 ────────────────────────────────────────────────
@@ -428,6 +524,13 @@ int main() {
 		{"decode array negative size rejected",
 		 test_decode_array_negative_size_rejected},
 		{"decode nested array boundary", test_decode_nested_array_boundary},
+		{"decode nested array and pipeline", test_decode_nested_array_and_pipeline},
+		{"decode nested array byte stream", test_decode_nested_array_byte_stream},
+		{"decode nested array error atomic", test_decode_nested_array_error_atomic},
+		{"decode array unknown member type rejected",
+		 test_decode_array_unknown_member_type_rejected},
+		{"decode array unknown member type streamed",
+		 test_decode_array_unknown_member_type_streamed},
 		{"append limits", test_append_limits},
 		{"bulk parameter limit", test_bulk_parameter_limit},
 		{"append rejection preserves buffer", test_append_rejection_preserves_buffer},

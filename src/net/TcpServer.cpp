@@ -46,7 +46,7 @@ void TcpServer::server_close_callback(std::shared_ptr<TcpConnection> conn) {
 		_server_close_callback(conn);
 	});
 	DEBUG_LOG << "connection: " << conn->get_peer_address().to_string_ip_port()
-			  << "close";
+			  << " close";
 }
 
 // 给Acceptor用的一个建立连接后的回调
@@ -64,8 +64,10 @@ void TcpServer::new_connection_callback(Socket connection_socket,
 			_server_read_callback, [this](std::shared_ptr<TcpConnection> conn) {
 				server_close_callback(conn);
 			});
-		_base_loop->run_or_queue_in_loop([this, conn]() {
+		_base_loop->run_or_queue_in_loop([this, conn, peer_address]() {
 			_connections.insert(conn);
+			DEBUG_LOG << "connection: " << peer_address.to_string_ip_port()
+					  << " connected.";
 			_pending_conn_count--;
 			if (_state == ServerState::Stopping) { conn->close(); }
 		});

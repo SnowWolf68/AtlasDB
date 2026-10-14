@@ -10,6 +10,9 @@ CMakeUserPresets.json
 # 日志
 logs/
 
+# 本地服务器数据
+/data/
+
 # 本地工具缓存
 .cache/
 .codex-review
@@ -22,3 +25,4 @@ logs/
 
 .zcodeignore
 .idea/
+data/

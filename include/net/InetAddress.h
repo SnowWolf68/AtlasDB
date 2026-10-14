@@ -17,7 +17,7 @@ public:
 	InetAddress(struct sockaddr_in sockaddr);
 	InetAddress();
 
-	std::string to_string_ip_port();
+	std::string to_string_ip_port() const;
 
 	struct sockaddr_in _sockaddr;
 	std::string _ip;

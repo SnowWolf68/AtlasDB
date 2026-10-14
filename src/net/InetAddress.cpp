@@ -47,6 +47,6 @@ struct in_addr InetAddress::ip_p2n(const std::string &ip) {
 	return addr;
 }
 
-std::string InetAddress::to_string_ip_port() {
+std::string InetAddress::to_string_ip_port() const {
 	return _ip + ":" + std::to_string(_port);
 }

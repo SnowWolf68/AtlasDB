@@ -168,8 +168,7 @@ bool Resp::check_integer(const std::string &integer_str) {
 }
 
 std::pair<Resp::DecodeResult, std::optional<std::size_t>>
-Resp::decode_except_array_without_erase(
-	std::optional<std::size_t> start_idx_opt) {
+Resp::decode_without_erase(std::optional<std::size_t> start_idx_opt) {
 	std::size_t start_idx =
 		start_idx_opt == std::nullopt ? 0 : start_idx_opt.value();
 	if (_buffer.size() - start_idx == 0) {
@@ -177,6 +176,63 @@ Resp::decode_except_array_without_erase(
 	}
 	char type = _buffer[0 + start_idx];
 	switch (type) {
+		case '*': {
+			std::size_t pos = _buffer.find(SEP, start_idx);
+			if (pos != _buffer.npos) {
+				std::size_t erase_count = 0;
+				std::string array_size_str =
+					_buffer.substr(1 + start_idx, pos - 1 - start_idx);
+				if (!check_integer(array_size_str)) {
+					return std::make_pair(
+						DecodeResult::DecodeErr("parse integer failed"),
+						std::nullopt);
+				}
+				int array_size = -1;
+				try {
+					array_size = std::stoi(array_size_str);
+				} catch (const std::exception &e) {
+					LOG(Log::ERROR) << "stoi parse failed, array_size decode "
+									   "failed, error: "
+									<< e.what();
+					return std::make_pair(
+						DecodeResult::DecodeErr(
+							"stoi parse failed, array_size decode failed."),
+						std::nullopt);
+				}
+				if (array_size < 0) {
+					return std::make_pair(
+						DecodeResult::DecodeErr(
+							"stoi parse failed, array_size decode failed."),
+						std::nullopt);
+				}
+				erase_count += (1 + array_size_str.size() + 2);
+				DecodeResult result;
+				for (int i = 0; i < array_size; i++) {
+					auto res = decode_without_erase(erase_count + start_idx);
+					if (res.first._state == DecodeState::NeedMore) {
+						return std::make_pair(DecodeResult::NeedMore(),
+											  std::nullopt);
+					} else if (res.first._state == DecodeState::Error ||
+							   res.second == std::nullopt) {
+						LOG(Log::ERROR)
+							<< "array member decode failed, errmsg: "
+							<< res.first._decode_err_msg;
+						return std::make_pair(
+							DecodeResult::DecodeErr(
+								"array member decode failed, errmsg: " +
+								res.first._decode_err_msg),
+							std::nullopt);
+					}
+					result._result_value._array.push_back(
+						res.first._result_value);
+					erase_count += res.second.value();
+				}
+				result._state = DecodeState::Complete;
+				result._result_value._value_type = RespValueType::Arrays;
+				return std::make_pair(result, erase_count);
+			}
+			break;
+		}
 		case '+': {
 			std::size_t pos = _buffer.find(SEP, start_idx);
 			if (pos != _buffer.npos) {
@@ -247,8 +303,8 @@ Resp::decode_except_array_without_erase(
 				}
 				if (size > _max_single_parameter_size) {
 					return std::make_pair(
-						DecodeResult::DecodeErr(
-							"bulkstring size exceeds max single param size"),
+						DecodeResult::DecodeErr("bulkstring size exceeds "
+												"max single param size"),
 						std::nullopt);
 				}
 				if (1 + size_str.size() + 2 + size + 2 >
@@ -271,76 +327,31 @@ Resp::decode_except_array_without_erase(
 			}
 			break;
 		}
+		default: {
+			return std::make_pair(DecodeResult::DecodeErr("type error, type: " +
+														  std::to_string(type)),
+								  std::nullopt);
+			break;
+		}
 	}
 	return std::make_pair(DecodeResult::NeedMore(), std::nullopt);
 }
 
 Resp::DecodeResult Resp::decode() {
-	if (_buffer.size() == 0) { return DecodeResult::NeedMore(); }
-	char type = _buffer[0];
-	if (type == '*') {
-		std::size_t pos = _buffer.find(SEP);
-		if (pos != _buffer.npos) {
-			std::size_t erase_count = 0;
-			std::string array_size_str = _buffer.substr(1, pos - 1);
-			if (!check_integer(array_size_str)) {
-				return DecodeResult::DecodeErr("parse integer failed");
-			}
-			int array_size = -1;
-			try {
-				array_size = std::stoi(array_size_str);
-			} catch (const std::exception &e) {
-				LOG(Log::ERROR) << "stoi parse failed, array_size decode "
-								   "failed, error: "
-								<< e.what();
-				return DecodeResult::DecodeErr(
-					"stoi parse failed, array_size decode failed.");
-			}
-			if (array_size < 0) {
-				return DecodeResult::DecodeErr(
-					"stoi parse failed, array_size decode failed.");
-			}
-			erase_count += (1 + array_size_str.size() + 2);
-			DecodeResult result;
-			for (int i = 0; i < array_size; i++) {
-				auto res = decode_except_array_without_erase(erase_count);
-				if (res.first._state == DecodeState::NeedMore) {
-					return DecodeResult::NeedMore();
-				} else if (res.first._state == DecodeState::Error ||
-						   res.second == std::nullopt) {
-					LOG(Log::ERROR) << "array member decode failed, errmsg: "
-									<< res.first._decode_err_msg;
-					return DecodeResult::DecodeErr(
-						"array member decode failed, errmsg: " +
-						res.first._decode_err_msg);
-				}
-				result._result_value._array.push_back(res.first._result_value);
-				erase_count += res.second.value();
-			}
-			_buffer.erase(0, erase_count);
-			result._result_value._value_type = RespValueType::Arrays;
-			result._state = DecodeState::Complete;
-			return result;
+	std::pair<DecodeResult, std::optional<std::size_t>> res =
+		decode_without_erase();
+	if (res.first._state == DecodeState::Complete) {
+		if (res.second == std::nullopt) {
+			LOG(Log::ERROR) << "erase count error";
+			return DecodeResult::Error("erase count error");
 		}
-	} else if (type == '+' || type == '-' || type == ':' || type == '$') {
-		std::pair<DecodeResult, std::optional<std::size_t>> res =
-			decode_except_array_without_erase();
-		if (res.first._state == DecodeState::Complete) {
-			if (res.second == std::nullopt) {
-				LOG(Log::ERROR) << "erase count error";
-				return DecodeResult::Error("erase count error");
-			}
-			_buffer.erase(0, res.second.value());
-			return res.first;
-		} else if (res.first._state == DecodeState::NeedMore) {
-			return DecodeResult::NeedMore();
-		} else {
-			// Error
-			return res.first;
-		}
+		_buffer.erase(0, res.second.value());
+		return res.first;
+	} else if (res.first._state == DecodeState::NeedMore) {
+		return DecodeResult::NeedMore();
 	} else {
-		return DecodeResult::DecodeErr("type error, type: " +
-									   std::to_string(type));
+		// Error
+		return res.first;
 	}
 	return DecodeResult::NeedMore();
 }
