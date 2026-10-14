@@ -451,6 +451,50 @@ void test_iterate_skip_filtered_block() {
 	rm_tmp(path);
 }
 
+void test_begin_skips_filtered_leading_blocks() {
+	const std::string path = tmp_path("begin_filtered_leading_blocks");
+	SSTBuilder builder;
+	const char *keys[] = {"a", "b", "z"};
+	const std::uint64_t sequences[] = {30, 20, 1};
+	for (std::size_t i = 0; i < 3; ++i) {
+		CHECK(builder.add(keys[i], std::string(20000, keys[i][0]), sequences[i], Value));
+	}
+	auto sst = builder.build(1, path);
+	CHECK(sst != nullptr);
+	CHECK(sst->num_blocks() == 3);
+	CHECK(sst->get(enc("z", 10)).has_value());
+	for (bool keep_all : {false, true}) {
+		for (std::uint64_t snapshot : {std::uint64_t{25}, std::uint64_t{10}, std::uint64_t{0}}) {
+			const std::vector<std::string> expected = snapshot == 25
+				? std::vector<std::string>{"b", "z"}
+				: snapshot == 10 ? std::vector<std::string>{"z"}
+								 : std::vector<std::string>{};
+			auto it = sst->begin(snapshot, keep_all);
+			std::size_t index = 0;
+			while (it.is_valid()) {
+				CHECK(index < expected.size());
+				CHECK(InternalKey::decode((*it).first)._key == expected[index]);
+				CHECK((*it).second == std::string(20000, expected[index][0]));
+				++index;
+				++it;
+			}
+			CHECK(index == expected.size());
+			CHECK(it == sst->end());
+			++it;
+			CHECK(it == sst->end());
+			index = 0;
+			for (auto other = sst->begin(snapshot, keep_all); other != sst->end(); ++other) {
+				CHECK(other.is_valid());
+				CHECK(index < expected.size());
+				CHECK(InternalKey::decode((*other).first)._key == expected[index]);
+				++index;
+			}
+			CHECK(index == expected.size());
+		}
+	}
+	rm_tmp(path);
+}
+
 // end() 哨兵上 ++ 应保持稳定(不漂移)
 void test_end_sentinel_stable() {
 	std::string path = tmp_path("end_stable");
@@ -517,6 +561,7 @@ int main() {
 		{"predicate seq same key versions",
 		 test_predicate_seq_same_key_versions},
 		{"iterate skip filtered block", test_iterate_skip_filtered_block},
+		{"begin skips filtered leading blocks", test_begin_skips_filtered_leading_blocks},
 		{"end sentinel stable", test_end_sentinel_stable},
 	};
 	return run_tests(tests);

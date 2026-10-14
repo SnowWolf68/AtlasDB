@@ -12,6 +12,41 @@
 #include <utility>
 #include <vector>
 
+#ifdef ATLASDB_SCAN_LOCK_CHECK
+#include <cerrno>
+#include <pthread.h>
+
+namespace {
+thread_local pthread_rwlock_t *tracked_sst_lock = nullptr;
+thread_local int sst_read_depth = 0;
+thread_local int sst_read_acquires = 0;
+thread_local int sst_read_reentries = 0;
+}
+
+extern "C" int __real_pthread_rwlock_rdlock(pthread_rwlock_t *lock);
+extern "C" int __real_pthread_rwlock_unlock(pthread_rwlock_t *lock);
+
+extern "C" int __wrap_pthread_rwlock_rdlock(pthread_rwlock_t *lock) {
+	if (lock == tracked_sst_lock && sst_read_depth != 0) {
+		++sst_read_reentries;
+		// Fail a recursive attempt immediately instead of risking a deadlock.
+		return EDEADLK;
+	}
+	int result = __real_pthread_rwlock_rdlock(lock);
+	if (result == 0 && lock == tracked_sst_lock) {
+		++sst_read_depth;
+		++sst_read_acquires;
+	}
+	return result;
+}
+
+extern "C" int __wrap_pthread_rwlock_unlock(pthread_rwlock_t *lock) {
+	int result = __real_pthread_rwlock_unlock(lock);
+	if (result == 0 && lock == tracked_sst_lock) { --sst_read_depth; }
+	return result;
+}
+#endif
+
 namespace {
 
 class TestFailure : public std::runtime_error {
@@ -175,6 +210,50 @@ void test_consistent_with_get() {
 	CHECK(entries[1].key == "b" && entries[1].value == "vb2");
 }
 
+#ifdef ATLASDB_SCAN_LOCK_CHECK
+class ScopedSstLockTracking {
+public:
+	explicit ScopedSstLockTracking(std::shared_mutex &mutex) {
+		tracked_sst_lock = static_cast<pthread_rwlock_t *>(mutex.native_handle());
+		sst_read_depth = 0;
+		sst_read_acquires = 0;
+		sst_read_reentries = 0;
+	}
+	~ScopedSstLockTracking() { tracked_sst_lock = nullptr; }
+};
+
+void check_sst_scan_lock(std::size_t level) {
+	const std::string dir = "/tmp/scan_test_lock_level_" + std::to_string(level);
+	std::filesystem::remove_all(dir);
+	std::filesystem::create_directories(dir);
+	SSTBuilder builder;
+	builder.add("a", "value", 1, Value);
+	CHECK(builder.build(1, dir + "/sst_00000000000000000000000000000001." +
+						   std::to_string(level)) != nullptr);
+	auto engine = std::make_shared<LSMEngine>(dir);
+	ScopedSstLockTracking tracking(engine->get_mutex());
+	{
+		auto it = engine->begin(1, false);
+		CHECK(sst_read_reentries == 0);
+		CHECK(sst_read_acquires == 1);
+		CHECK(sst_read_depth == 1);
+		CHECK(it.is_valid());
+		CHECK(InternalKey::decode((*it).first)._key == "a");
+		CHECK((*it).second == "value");
+		++it;
+		CHECK(it == engine->end());
+		// Exhaustion must not release the iterator's lifetime lock early.
+		CHECK(sst_read_depth == 1);
+	}
+	CHECK(sst_read_reentries == 0);
+	CHECK(sst_read_acquires == 1);
+	CHECK(sst_read_depth == 0);
+}
+
+void test_l0_scan_lock_not_recursive() { check_sst_scan_lock(0); }
+void test_l1_scan_lock_not_recursive() { check_sst_scan_lock(1); }
+#endif
+
 // ─── 测试注册 ───────────────────────────────────────────────────
 
 struct TestCase {
@@ -194,6 +273,10 @@ int main() {
 		{"empty engine", test_empty_engine},
 		{"end after exhaustion", test_end_after_exhaustion},
 		{"consistent with get", test_consistent_with_get},
+#ifdef ATLASDB_SCAN_LOCK_CHECK
+		{"L0 scan lock not recursive", test_l0_scan_lock_not_recursive},
+		{"L1 scan lock not recursive", test_l1_scan_lock_not_recursive},
+#endif
 	};
 
 	std::size_t passed = 0;

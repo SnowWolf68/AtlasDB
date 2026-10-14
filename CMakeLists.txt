@@ -1,29 +1,20 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(AtlasDB VERSION 1.0.0 LANGUAGES CXX)
+project(AtlasDB VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(ATLASDB_BUILD_APP "Build the interactive AtlasDB demo" ON)
+option(ATLASDB_BUILD_APP "Build the AtlasDB RESP server" ON)
 
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
-add_library(
-	atlasdb
-	src/Block.cpp
-	src/BlockMeta.cpp
-	src/Comparator.cpp
-	src/MemTable.cpp
-	src/Record.cpp
-	src/SkipList.cpp
-	src/log.cpp
-	src/lsm.cpp
-	src/sst.cpp
-	src/TranContext.cpp
-	src/util.cpp
-	src/wal.cpp
+file(GLOB_RECURSE ATLASDB_SOURCES CONFIGURE_DEPENDS
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
 )
+list(REMOVE_ITEM ATLASDB_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+
+add_library(atlasdb ${ATLASDB_SOURCES})
 add_library(AtlasDB::AtlasDB ALIAS atlasdb)
 
 target_compile_features(atlasdb PUBLIC cxx_std_17)

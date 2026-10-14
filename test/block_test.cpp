@@ -501,6 +501,62 @@ void test_block_predicate_single() {
 	CHECK(count == 1);
 }
 
+// Exact lookup must terminate at both ends of the closed search interval.
+void test_exact_lookup_empty_block() {
+	auto block = std::make_shared<Block>();
+	auto key = InternalKey::encode(InternalKey("a", 10, Value));
+	CHECK(!block->get_value(key).has_value());
+	CHECK(!block->get_exact(key).has_value());
+}
+
+void test_exact_lookup_single_entry_boundaries() {
+	auto block = make_block_with_data({"m"}, {"value"});
+	for (const auto &user_key : {"a", "z"}) {
+		auto key = InternalKey::encode(InternalKey(user_key, 10, Value));
+		CHECK(!block->get_value(key).has_value());
+		CHECK(!block->get_exact(key).has_value());
+	}
+	for (std::uint64_t seq : {9, 11}) {
+		auto key = InternalKey::encode(InternalKey("m", seq, Value));
+		CHECK(!block->get_value(key).has_value());
+		CHECK(!block->get_exact(key).has_value());
+	}
+	auto key = InternalKey::encode(InternalKey("m", 10, Value));
+	auto value = block->get_value(key);
+	CHECK(value.has_value());
+	CHECK(value->first == key);
+	CHECK(value->second == "value");
+	auto exact = block->get_exact(key);
+	CHECK(exact.has_value());
+	CHECK(exact->is_valid());
+	CHECK(**exact == *value);
+}
+
+void test_exact_lookup_multiple_entry_boundaries() {
+	auto block = make_block_with_data({"b", "m", "y"}, {"first", "middle", "last"});
+	for (const auto &user_key : {"a", "c", "n", "z"}) {
+		auto key = InternalKey::encode(InternalKey(user_key, 10, Value));
+		CHECK(!block->get_value(key).has_value());
+		CHECK(!block->get_exact(key).has_value());
+	}
+	const std::vector<std::string> keys = {"b", "m", "y"};
+	const std::vector<std::string> values = {"first", "middle", "last"};
+	for (std::size_t i = 0; i < keys.size(); ++i) {
+		auto key = InternalKey::encode(InternalKey(keys[i], 10, Value));
+		auto value = block->get_value(key);
+		CHECK(value.has_value());
+		CHECK(value->first == key);
+		CHECK(value->second == values[i]);
+		auto exact = block->get_exact(key);
+		CHECK(exact.has_value());
+		CHECK(exact->is_valid());
+		CHECK(exact->get_cur_idx() == i);
+		CHECK((**exact).first == key);
+		CHECK((**exact).second == values[i]);
+		CHECK(**exact == *value);
+	}
+}
+
 // ─── test runner ────────────────────────────────────────────────
 
 struct TestCase {
@@ -556,6 +612,9 @@ int main() {
 		 test_block_predicate_empty},
 		{"block predicate single",
 		 test_block_predicate_single},
+		{"exact lookup empty block", test_exact_lookup_empty_block},
+		{"exact lookup single entry boundaries", test_exact_lookup_single_entry_boundaries},
+		{"exact lookup multiple entry boundaries", test_exact_lookup_multiple_entry_boundaries},
 	};
 
 	std::size_t passed = 0;

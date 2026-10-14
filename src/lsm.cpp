@@ -359,6 +359,27 @@ std::optional<std::uint64_t> LSMEngine::remove(const std::string &key) {
 	return res;
 }
 
+LSMEngine::DelResult LSMEngine::del(const std::string &key) {
+	if (key.size() > MAX_KEY_LEN) { return DelResult::Error; }
+	LookUpResult get_res{};
+	std::optional<std::uint64_t> res = std::nullopt;
+	{
+		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
+		std::shared_lock<std::shared_mutex> shared(_close_mutex);
+		get_res = get(key);
+		std::uint64_t commit_sequence = _commit_sequence.load() + 1;
+		res = apply_insert(key, "", commit_sequence, ValueType::TombStone);
+		_commit_sequence.fetch_add(1);
+	}
+	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
+	if (res == std::nullopt) { return DelResult::Error; }
+	if ((get_res._value_type == NotFound || get_res._value_type == TombStone) &&
+		res != std::nullopt) {
+		return DelResult::NotFound;
+	}
+	return DelResult::Success;
+}
+
 /**
 	-- return:
 		空批: 当前水位
@@ -552,15 +573,14 @@ ConcatIterator::ConcatIterator(std::vector<std::shared_ptr<SST>> ssts,
 			return;
 		}
 		_sst_iter =
-			_ssts[cur_sst_idx]->begin(_commit_sequence, _keep_all_version);
+			_ssts[_cur_sst_idx]->begin(_commit_sequence, _keep_all_version);
 	}
 }
 
-ConcatIterator
-LSMEngine::level_begin(std::size_t level_idx,
-					   std::optional<std::uint64_t> commit_sequence,
-					   bool keep_all_version) {
-	std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
+ConcatIterator LSMEngine::level_begin_without_lock(
+	std::size_t level_idx, std::optional<std::uint64_t> commit_sequence,
+	bool keep_all_version) {
+	// std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
 	if (_sst_id_map.find(level_idx) == _sst_id_map.end()) {
 		return ConcatIterator(std::vector<std::shared_ptr<SST>>(), 0,
 							  std::nullopt, false);
@@ -581,11 +601,11 @@ ConcatIterator LSMEngine::level_end(std::size_t level_idx) {
 						  _sst_id_map[level_idx].size(), std::nullopt, false);
 }
 
-HeapIterator
-LSMEngine::level_0_begin(std::optional<std::uint64_t> commit_sequence,
-						 bool keep_all_version, bool skip_tombstone) {
+HeapIterator LSMEngine::level_0_begin_without_lock(
+	std::optional<std::uint64_t> commit_sequence, bool keep_all_version,
+	bool skip_tombstone) {
 	HeapIterator heap_it(skip_tombstone, commit_sequence, keep_all_version);
-	std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
+	// std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
 	if (_sst_id_map.find(0) != _sst_id_map.end()) {
 		for (std::size_t l0_id : _sst_id_map[0]) {
 			std::shared_ptr<SST> cur_sst = _ssts[l0_id];
@@ -1217,13 +1237,13 @@ LSMEngineIterator::LSMEngineIterator(
 			continue;
 		}
 		if (level == 0) {
-			HeapIterator heap_it = _engine->level_0_begin(
+			HeapIterator heap_it = _engine->level_0_begin_without_lock(
 				_commit_sequence, _keep_all_version, false);
 			_iters.push_back(
 				std::make_shared<HeapIterator>(std::move(heap_it)));
 		} else {
-			_iters.push_back(
-				std::make_shared<ConcatIterator>(std::move(_engine->level_begin(
+			_iters.push_back(std::make_shared<ConcatIterator>(
+				std::move(_engine->level_begin_without_lock(
 					level, _commit_sequence, _keep_all_version))));
 		}
 	}
@@ -1359,6 +1379,11 @@ bool LSMEngineIterator::is_valid() const {
 
 LSM::LSM(const std::string &data_dir)
 	: _engine(std::make_shared<LSMEngine>(data_dir)) {}
+std::size_t LSM::get_max_key_size() { return _engine->MAX_KEY_LEN; }
+std::size_t LSM::get_max_value_size() { return Block::MAX_VALUE_LEN - 1; }
+LSMEngine::DelResult LSM::del(const std::string &key) {
+	return _engine->del(key);
+}
 std::optional<std::uint64_t> LSM::put(const std::string &key,
 									  const std::string &value) {
 	return _engine->put(key, value);

@@ -167,15 +167,10 @@ std::vector<std::uint8_t> FileObj::read(std::size_t offset,
 	// char buf[length];
 	std::vector<std::uint8_t> buf(length);
 	// ::memset(buf, 0, length);
-	off_t off = ::lseek(_fd, offset, SEEK_SET);
-	if (off == -1) {
-		throw std::runtime_error("lseek, fd: " + std::to_string(_fd) +
-								 " , errno: " + strerror(errno));
-	}
 	ssize_t read_bytes = 0;
 	while (read_bytes < length) {
-		ssize_t cur_size =
-			::read(_fd, buf.data() + read_bytes, length - read_bytes);
+		ssize_t cur_size = ::pread(_fd, buf.data() + read_bytes,
+								   length - read_bytes, offset + read_bytes);
 		if (cur_size == -1) {
 			if (errno == EINTR) {
 				continue;
