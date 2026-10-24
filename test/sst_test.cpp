@@ -2,9 +2,12 @@
 #include "BlockMeta.h"
 #include "Record.h"
 #include "sst.h"
+#include "binary_test_helpers.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <exception>
@@ -218,6 +221,143 @@ void test_open_truncated_file() {
 	auto sst = SST::open(path, 1);
 	CHECK(sst == nullptr); // 文件太短（< 5 字节）
 	rm_tmp(path);
+}
+
+class ScopedSstFixture {
+public:
+	ScopedSstFixture() {
+		const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+		for (unsigned attempt = 0; attempt < 1000; ++attempt) {
+			auto candidate = std::filesystem::temp_directory_path() /
+				("atlasdb-sst-boundaries-" + std::to_string(stamp) + "-" + std::to_string(attempt));
+			if (std::filesystem::create_directory(candidate)) {
+				directory = candidate;
+				path = (directory / "fixture.sst").string();
+				return;
+			}
+		}
+		throw std::runtime_error("cannot create SST fixture directory");
+	}
+	~ScopedSstFixture() {
+		std::error_code error;
+		std::filesystem::remove_all(directory, error);
+	}
+	ScopedSstFixture(const ScopedSstFixture &) = delete;
+	ScopedSstFixture &operator=(const ScopedSstFixture &) = delete;
+
+	void write(const std::vector<std::uint8_t> &bytes) {
+		FileObj::create_and_write(path, bytes);
+	}
+	std::string path;
+
+private:
+	std::filesystem::path directory;
+};
+
+std::vector<std::uint8_t> boundary_block_bytes() {
+	Block block;
+	CHECK(block.add_entry(enc("key", 10), "value", false));
+	return block.encode(true);
+}
+
+std::vector<std::uint8_t> sst_fixture_bytes(
+	const std::vector<std::uint8_t> &data, const std::vector<BlockMeta> &metas) {
+	auto bytes = data;
+	const auto metadata = BlockMeta::encode(metas);
+	bytes.insert(bytes.end(), metadata.begin(), metadata.end());
+	binary_test::append_u32(bytes, static_cast<std::uint32_t>(data.size()));
+	bytes.push_back(SSTBuilder::MAGIC_NUM);
+	return bytes;
+}
+
+void test_open_rejects_empty_metadata() {
+	const auto empty_metadata = BlockMeta::decode(BlockMeta::encode({}));
+	CHECK(empty_metadata.has_value() && empty_metadata->empty());
+	for (const auto &data : std::vector<std::vector<std::uint8_t>>{{}, boundary_block_bytes()}) {
+		ScopedSstFixture fixture;
+		// A valid checksum and footer must not hide the empty-metadata case.
+		fixture.write(sst_fixture_bytes(data, {}));
+		CHECK(SST::open(fixture.path, 1) == nullptr);
+	}
+}
+
+void test_open_rejects_metadata_offsets_past_footer() {
+	const auto data = boundary_block_bytes();
+	const auto key = enc("key", 10);
+	const auto valid = sst_fixture_bytes(data, {BlockMeta(0, key, key)});
+	const auto footer_start = valid.size() - 5;
+	for (std::uint32_t offset : {static_cast<std::uint32_t>(footer_start + 1),
+		static_cast<std::uint32_t>(valid.size()), 0xfffffffbu, 0xfffffffcu, 0xffffffffu}) {
+		ScopedSstFixture fixture;
+		auto malformed = valid;
+		binary_test::overwrite_u32(malformed, footer_start, offset);
+		fixture.write(malformed);
+		CHECK(SST::open(fixture.path, 1) == nullptr);
+	}
+	ScopedSstFixture control;
+	control.write(valid);
+	auto sst = SST::open(control.path, 1);
+	CHECK(sst != nullptr);
+	auto block = sst->read_block(0);
+	CHECK(block != nullptr);
+	CHECK(*block->begin() == std::make_pair(key, std::string("value")));
+}
+
+void test_read_block_rejects_reversed_offsets() {
+	const auto data = boundary_block_bytes();
+	const auto end = static_cast<std::uint32_t>(data.size());
+	const auto key = enc("key", 10);
+	for (bool last_block : {false, true}) {
+		const std::vector<BlockMeta> metas = last_block
+			? std::vector<BlockMeta>{BlockMeta(0, key, key), BlockMeta(end + 1, key, key)}
+			: std::vector<BlockMeta>{BlockMeta(end - 1, key, key), BlockMeta(0, key, key)};
+		ScopedSstFixture fixture;
+		fixture.write(sst_fixture_bytes(data, metas));
+		auto sst = SST::open(fixture.path, 1);
+		CHECK(sst != nullptr);
+		CHECK(sst->read_block(last_block ? 1 : 0) == nullptr);
+	}
+}
+
+void test_read_block_rejects_offsets_outside_file() {
+	const auto data = boundary_block_bytes();
+	const auto key = enc("key", 10);
+	const auto normal_size = static_cast<std::uint32_t>(sst_fixture_bytes(data,
+		{BlockMeta(0, key, key), BlockMeta(0, key, key)}).size());
+	for (bool start_outside : {false, true}) {
+		ScopedSstFixture fixture;
+		const auto first = start_outside ? normal_size + 1 : 0;
+		fixture.write(sst_fixture_bytes(data,
+			{BlockMeta(first, key, key), BlockMeta(normal_size + 2, key, key)}));
+		auto sst = SST::open(fixture.path, 1);
+		CHECK(sst != nullptr);
+		CHECK(sst->read_block(0) == nullptr);
+	}
+}
+
+void test_read_block_rejects_metadata_region() {
+	const auto data = boundary_block_bytes();
+	const auto key = enc("key", 10);
+	const auto block_end = static_cast<std::uint32_t>(data.size());
+	ScopedSstFixture fixture;
+	fixture.write(sst_fixture_bytes(data, {BlockMeta(0, key, key)}));
+	const std::vector<BlockMeta> metas = {BlockMeta(0, key, key), BlockMeta(block_end, key, key)};
+	// Seed the public constructor so the referenced bytes form a CRC-valid
+	// block, but its end crosses the declared metadata boundary by one byte.
+	// Without that boundary check, CRC validation alone accepts this block.
+	SST malformed(FileObj::open_read(fixture.path), metas, block_end - 1, 1, key, key);
+	CHECK(malformed.read_block(0) == nullptr);
+	SST control(FileObj::open_read(fixture.path), metas, block_end, 1, key, key);
+	auto block = control.read_block(0);
+	CHECK(block != nullptr);
+	CHECK(*block->begin() == std::make_pair(key, std::string("value")));
+}
+
+void test_empty_builder_does_not_publish_sst() {
+	ScopedSstFixture fixture;
+	SSTBuilder builder;
+	CHECK(builder.build(1, fixture.path) == nullptr);
+	CHECK(!std::filesystem::exists(fixture.path));
 }
 
 // ─── tombstone ──────────────────────────────────────────────────
@@ -547,6 +687,12 @@ int main() {
 		{"iterate multi block", test_iterate_multi_block},
 		{"open corrupt magic", test_open_corrupt_magic},
 		{"open truncated file", test_open_truncated_file},
+		{"open rejects empty metadata", test_open_rejects_empty_metadata},
+		{"open rejects metadata offsets past footer", test_open_rejects_metadata_offsets_past_footer},
+		{"read block rejects reversed offsets", test_read_block_rejects_reversed_offsets},
+		{"read block rejects offsets outside file", test_read_block_rejects_offsets_outside_file},
+		{"read block rejects metadata region", test_read_block_rejects_metadata_region},
+		{"empty builder does not publish sst", test_empty_builder_does_not_publish_sst},
 		{"tombstone entry readable", test_tombstone_entry_readable},
 		{"predicate single block", test_predicate_single_block},
 		{"predicate no match gap", test_predicate_no_match_gap},

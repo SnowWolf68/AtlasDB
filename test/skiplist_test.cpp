@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -366,22 +367,7 @@ void test_preffix_basic() {
 	CHECK(result.has_value());
 	auto [begin, end] = result.value();
 
-	// "app" < "apple" < "application" < "apricot" < "b"...
-	// "app" successor = "apq"... so "apricot" < "apq" → included
-	// Wait, successor of "app" is... 'p'+1 = 'q', so "apq"
-	// "apricot" < "apq"? "apq" < "apricot"? "apq" (3 chars) vs "apricot" (7 chars)
-	// "apq" < "apricot" because 'q' < 'r' at position 2
-	// So end is at "apricot" → wait no.
-	// Let me think more carefully:
-	// successor of "app" = "apq" (last byte 'p'+1 = 'q')
-	// keys sorted: "apple", "application", "apricot", "banana"
-	// "apple" >= "app", "application" >= "app", "apricot" >= "app" → all three >= begin
-	// "apple" < "apq"? 'p'(3rd byte of apple='p') vs 'p'(1st byte of apq='a') Wait no...
-	// "apple" vs "apq": first two chars "ap" match, 3rd char 'p' vs 'q'. 'p' < 'q' → "apple" < "apq"
-	// "application" vs "apq": "ap" match, 3rd char 'p' vs 'q'. 'p' < 'q' → "application" < "apq"
-	// "apricot" vs "apq": "ap" match, 3rd char 'r' vs 'q'. 'r' > 'q' → "apricot" >= "apq"
-	// So end is at "apricot", range is [apple, application]
-	
+	// Prefix "app" covers ["app", "apq"); "apricot" is the first key past it.
 	int count = 0;
 	for (auto it = begin; it != end; ++it) count++;
 	CHECK(count == 2);  // "apple", "application"
@@ -408,6 +394,75 @@ void test_preffix_exact_match() {
 	int count = 0;
 	for (auto it = begin; it != end; ++it) count++;
 	CHECK(count == 2);  // "app", "apple" (not "apricot")
+}
+
+void test_preffix_excludes_existing_upper_bound() {
+	SkipList list;
+	CHECK(list.put("apq", "excluded-upper-bound"));
+	CHECK(list.put("application", "3"));
+	CHECK(list.put("apricot", "excluded-after-bound"));
+	CHECK(list.put("app", "1"));
+	CHECK(list.put("apple", "2"));
+	CHECK(list.put("ape", "excluded-before-prefix"));
+
+	auto result = list.preffix_raw_string("app");
+	CHECK(result.has_value());
+	auto [begin, end] = result.value();
+	const std::vector<std::pair<std::string, std::string>> expected = {
+		{"app", "1"}, {"apple", "2"}, {"application", "3"}};
+	auto it = begin;
+	for (const auto &entry : expected) {
+		CHECK(it != end);
+		CHECK(it.is_valid());
+		CHECK(*it == entry);
+		++it;
+	}
+	CHECK(it == end);
+	CHECK(end == list.lower_bound("apq"));
+	CHECK(end.is_valid());
+	CHECK(end.key() == "apq");
+}
+
+void test_preffix_only_upper_bound_is_not_a_match() {
+	SkipList list;
+	CHECK(list.put("ape", "before-prefix"));
+	CHECK(list.put("apq", "upper-bound"));
+
+	// The boundary is the last node; it must not create a false match.
+	CHECK(!list.preffix_raw_string("app").has_value());
+	CHECK(list.size() == 2);
+	check_value(list, "apq", "upper-bound");
+}
+
+void test_preffix_carry_excludes_existing_upper_bound() {
+	SkipList list;
+	const std::string prefix("a\xff", 2);
+	const std::vector<std::pair<std::string, std::string>> expected = {
+		{prefix, "exact-prefix"},
+		{prefix + std::string(1, '\0'), "nul-suffix"},
+		{prefix + std::string(1, static_cast<char>(0xff)), "ff-suffix"}};
+	CHECK(list.put("a", "before-prefix"));
+	for (const auto &entry : expected) {
+		CHECK(list.put(entry.first, entry.second));
+	}
+	CHECK(list.put("b", "upper-bound"));
+	CHECK(list.put("ba", "after-bound"));
+
+	// Carrying past the trailing 0xff makes "b" the exclusive upper bound.
+	auto result = list.preffix_raw_string(prefix);
+	CHECK(result.has_value());
+	auto [begin, end] = result.value();
+	auto it = begin;
+	for (const auto &entry : expected) {
+		CHECK(it != end);
+		CHECK(it.is_valid());
+		CHECK(*it == entry);
+		++it;
+	}
+	CHECK(it == end);
+	CHECK(end == list.lower_bound("b"));
+	CHECK(end.is_valid());
+	CHECK(end.key() == "b");
 }
 
 void test_preffix_ff_boundary() {
@@ -453,6 +508,12 @@ int main() {
 		{"preffix basic", test_preffix_basic},
 		{"preffix no match", test_preffix_no_match},
 		{"preffix exact match", test_preffix_exact_match},
+		{"preffix excludes existing upper bound",
+		 test_preffix_excludes_existing_upper_bound},
+		{"preffix only upper bound is not a match",
+		 test_preffix_only_upper_bound_is_not_a_match},
+		{"preffix carry excludes existing upper bound",
+		 test_preffix_carry_excludes_existing_upper_bound},
 		{"preffix ff boundary", test_preffix_ff_boundary},
 	};
 

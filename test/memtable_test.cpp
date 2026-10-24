@@ -8,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -492,6 +493,288 @@ void test_monotony_predicate_with_frozen() {
 	CHECK(InternalKey::decode(item.first)._commit_sequence == 10);
 }
 
+// ─── heap iterator advancement ─────────────────────────────────
+
+struct ExpectedHeapEntry {
+	std::string key;
+	std::string value;
+	std::uint64_t seq;
+	ValueType type = Value;
+};
+
+void check_heap_entries(HeapIterator it,
+						const std::vector<ExpectedHeapEntry> &expected) {
+	for (const auto &entry : expected) {
+		CHECK(it.is_valid());
+		const auto actual = *it;
+		CHECK(actual.first == InternalKey::encode(
+			InternalKey(entry.key, entry.seq, entry.type)));
+		CHECK(actual.second == entry.value);
+		CHECK(&(++it) == &it);
+	}
+	CHECK(!it.is_valid());
+	CHECK(it == HeapIterator(true));
+	CHECK(&(++it) == &it);
+	CHECK(&(++it) == &it);
+	CHECK(!it.is_valid());
+}
+
+// These tests use the container constructor directly. Do not call clean or ++
+// before observing the first result: initialization must establish that state.
+void test_heap_container_constructor_builds_unsorted_input() {
+	for (bool keep_all : {false, true}) {
+		std::vector<HeapIterator::HeapItem> items{
+			{"z", "last", 3, Value},
+			{"a", "old", 5, Value},
+			{"b", "", 4, Value},
+			{"a", "new", 9, Value},
+		};
+		HeapIterator it(std::move(items), false, keep_all);
+		CHECK(it.is_valid());
+		const HeapIterator &view = it;
+		CHECK((*view).first == InternalKey::encode(InternalKey("a", 9, Value)));
+		CHECK((*view).second == "new");
+		const auto first = *view;
+		CHECK(*view == first);
+		if (keep_all) {
+			check_heap_entries(std::move(it),
+				{{"a", "new", 9}, {"a", "old", 5}, {"b", "", 4},
+				 {"z", "last", 3}});
+		} else {
+			check_heap_entries(std::move(it),
+				{{"a", "new", 9}, {"b", "", 4}, {"z", "last", 3}});
+		}
+	}
+}
+
+void test_heap_container_constructor_filters_future_head() {
+	for (bool skip_tombstone : {false, true}) {
+		for (bool keep_all : {false, true}) {
+			std::vector<HeapIterator::HeapItem> items{
+				{"b", "b", 4, Value},
+				{"a", "future", 20, Value},
+				{"a", "old", 5, Value},
+				{"a", "", 30, TombStone},
+				{"a", "at-snapshot", 10, Value},
+			};
+			HeapIterator it(std::move(items), skip_tombstone, keep_all, 10);
+			if (keep_all) {
+				check_heap_entries(std::move(it),
+					{{"a", "at-snapshot", 10}, {"a", "old", 5}, {"b", "b", 4}});
+			} else {
+				check_heap_entries(std::move(it),
+					{{"a", "at-snapshot", 10}, {"b", "b", 4}});
+			}
+		}
+	}
+}
+
+void test_heap_container_constructor_skips_leading_tombstones() {
+	for (bool keep_all : {false, true}) {
+		std::vector<HeapIterator::HeapItem> items{
+			{"c", "", 5, Value},
+			{"a", "old-a", 2, Value},
+			{"b", "", 7, TombStone},
+			{"a", "", 6, TombStone},
+			{"b", "old-b", 3, Value},
+		};
+		HeapIterator it(std::move(items), true, keep_all, 10);
+		// Tombstones hide their older values even when all versions are requested;
+		// an empty Value payload is still a valid result.
+		check_heap_entries(std::move(it), {{"c", "", 5}});
+	}
+}
+
+void test_heap_container_constructor_orders_snapshot_and_tombstone_filters() {
+	for (bool skip_tombstone : {false, true}) {
+		for (bool keep_all : {false, true}) {
+			std::vector<HeapIterator::HeapItem> items{
+				{"b", "", 20, TombStone},
+				{"a", "old-a", 5, Value},
+				{"b", "old-b", 3, Value},
+				{"a", "future-a", 30, Value},
+				{"b", "visible-b", 8, Value},
+				{"a", "", 10, TombStone},
+			};
+			HeapIterator it(std::move(items), skip_tombstone, keep_all, 15);
+			std::vector<ExpectedHeapEntry> expected;
+			if (!skip_tombstone) {
+				expected.push_back({"a", "", 10, TombStone});
+				if (keep_all) { expected.push_back({"a", "old-a", 5}); }
+			}
+			expected.push_back({"b", "visible-b", 8});
+			if (keep_all) { expected.push_back({"b", "old-b", 3}); }
+			check_heap_entries(std::move(it), expected);
+		}
+	}
+}
+
+void test_heap_container_constructor_all_future_is_end() {
+	for (bool skip_tombstone : {false, true}) {
+		for (bool keep_all : {false, true}) {
+			std::vector<HeapIterator::HeapItem> items{
+				{"b", "", 30, TombStone}, {"a", "future", 20, Value},
+			};
+			HeapIterator it(std::move(items), skip_tombstone, keep_all, 10);
+			check_heap_entries(std::move(it), {});
+		}
+	}
+}
+
+void test_heap_container_constructor_all_deleted_is_end() {
+	for (bool keep_all : {false, true}) {
+		std::vector<HeapIterator::HeapItem> items{
+			{"b", "old-b", 2, Value},
+			{"a", "", 8, TombStone},
+			{"b", "", 9, TombStone},
+			{"a", "old-a", 1, Value},
+		};
+		HeapIterator it(std::move(items), true, keep_all, 10);
+		check_heap_entries(std::move(it), {});
+	}
+}
+
+void test_heap_container_constructor_empty_input() {
+	for (bool skip_tombstone : {false, true}) {
+		for (bool keep_all : {false, true}) {
+			HeapIterator it(std::vector<HeapIterator::HeapItem>{},
+				skip_tombstone, keep_all, 0);
+			check_heap_entries(it, {});
+			bool threw = false;
+			try { (void)*it; }
+			catch (const std::runtime_error &) { threw = true; }
+			CHECK(threw);
+		}
+	}
+}
+
+void test_heap_container_constructor_default_snapshot_and_binary_data() {
+	const std::string binary_key("a\0b", 3);
+	const std::string binary_value("v\0\xff", 3);
+	for (bool explicit_nullopt : {false, true}) {
+		std::vector<HeapIterator::HeapItem> items{
+			{binary_key, binary_value, MAX_COMMIT_SEQUENCE, Value},
+			{"", "", 0, Value},
+		};
+		HeapIterator it = explicit_nullopt
+			? HeapIterator(std::move(items), true, true, std::nullopt)
+			: HeapIterator(std::move(items), true, true);
+		check_heap_entries(std::move(it),
+			{{"", "", 0}, {binary_key, binary_value, MAX_COMMIT_SEQUENCE}});
+	}
+}
+
+void test_begin_filters_before_first_observation() {
+	MemTable table;
+	table.put("", "future-first-key", 20);
+	table.put("a", "old", 1);
+	table.remove("a", 8);
+	table.put("b", "", 5);
+	for (bool keep_all : {false, true}) {
+		check_heap_entries(table.begin(10, keep_all, true), {{"b", "", 5}});
+		check_heap_entries(table.begin(0, keep_all, true), {});
+	}
+}
+
+void test_heap_empty_increment_and_dereference() {
+	for (bool keep_all : {false, true}) {
+		for (bool skip_tombstone : {false, true}) {
+			HeapIterator it(skip_tombstone, std::uint64_t{10}, keep_all);
+			check_heap_entries(it, {});
+			bool threw = false;
+			try { (void)*it; }
+			catch (const std::runtime_error &) { threw = true; }
+			CHECK(threw);
+		}
+	}
+}
+
+void test_heap_increment_version_modes() {
+	MemTable table;
+	table.put("a", "old", 1);
+	table.put("a", "new", 2);
+	table.put("b", "", 3);
+	table.put("b", "future", 30);
+	for (bool skip_tombstone : {false, true}) {
+		check_heap_entries(table.begin(10, false, skip_tombstone),
+			{{"a", "new", 2}, {"b", "", 3}});
+		check_heap_entries(table.begin(10, true, skip_tombstone),
+			{{"a", "new", 2}, {"a", "old", 1}, {"b", "", 3}});
+	}
+}
+
+void test_heap_increment_consecutive_visible_tombstones() {
+	// The small threshold spreads these versions over active and frozen tables.
+	MemTable table(32);
+	table.put("a", "a", 1);
+	table.put("b", "old-b", 2);
+	table.put("c", "old-c", 3);
+	table.remove("b", 4);
+	table.remove("c", 5);
+	table.put("d", "d", 6);
+	for (bool keep_all : {false, true}) {
+		check_heap_entries(table.begin(10, keep_all, true),
+			{{"a", "a", 1}, {"d", "d", 6}});
+	}
+	check_heap_entries(table.begin(10, false, false),
+		{{"a", "a", 1}, {"b", "", 4, TombStone},
+		 {"c", "", 5, TombStone}, {"d", "d", 6}});
+	check_heap_entries(table.begin(10, true, false),
+		{{"a", "a", 1}, {"b", "", 4, TombStone}, {"b", "old-b", 2},
+		 {"c", "", 5, TombStone}, {"c", "old-c", 3}, {"d", "d", 6}});
+}
+
+void test_heap_increment_filters_future_tombstone_first() {
+	MemTable table;
+	table.put("a", "a", 1);
+	table.put("b", "old", 5);
+	table.put("b", "visible", 10);
+	table.put("c", "c", 12);
+	table.remove("b", 20);
+	for (bool skip_tombstone : {false, true}) {
+		check_heap_entries(table.begin(15, false, skip_tombstone),
+			{{"a", "a", 1}, {"b", "visible", 10}, {"c", "c", 12}});
+		check_heap_entries(table.begin(15, true, skip_tombstone),
+			{{"a", "a", 1}, {"b", "visible", 10}, {"b", "old", 5},
+			 {"c", "c", 12}});
+	}
+}
+
+void test_heap_increment_skips_future_keys_and_tail() {
+	MemTable table;
+	table.put("a", "a", 1);
+	table.put("b", "future", 20);
+	table.remove("c", 30);
+	table.put("d", "d", 4);
+	table.put("e", "future", 50);
+	for (bool keep_all : {false, true}) {
+		for (bool skip_tombstone : {false, true}) {
+			check_heap_entries(table.begin(10, keep_all, skip_tombstone),
+				{{"a", "a", 1}, {"d", "d", 4}});
+			check_heap_entries(table.begin(0, keep_all, skip_tombstone), {});
+		}
+	}
+}
+
+void test_heap_increment_tombstone_between_versions() {
+	MemTable table;
+	table.put("", "old", 10);
+	table.remove("", 20);
+	table.put("", "new", 30);
+	const std::string binary_key("b\0x", 3);
+	const std::string binary_value("v\0x", 3);
+	table.put(binary_key, binary_value, 5);
+	check_heap_entries(table.begin(30, true, true),
+		{{"", "new", 30}, {binary_key, binary_value, 5}});
+	check_heap_entries(table.begin(30, true, false),
+		{{"", "new", 30}, {"", "", 20, TombStone}, {"", "old", 10},
+		 {binary_key, binary_value, 5}});
+	for (bool skip_tombstone : {false, true}) {
+		check_heap_entries(table.begin(30, false, skip_tombstone),
+			{{"", "new", 30}, {binary_key, binary_value, 5}});
+	}
+}
+
 // ─── get_total_size / clear ─────────────────────────────────────
 
 void test_get_total_size_empty() {
@@ -649,6 +932,35 @@ int main() {
 		 test_monotony_predicate_all_visible_with_max_seq},
 		{"monotony predicate with frozen",
 		 test_monotony_predicate_with_frozen},
+		{"heap empty increment and dereference",
+		 test_heap_empty_increment_and_dereference},
+		{"heap container constructor builds unsorted input",
+		 test_heap_container_constructor_builds_unsorted_input},
+		{"heap container constructor filters future head",
+		 test_heap_container_constructor_filters_future_head},
+		{"heap container constructor skips leading tombstones",
+		 test_heap_container_constructor_skips_leading_tombstones},
+		{"heap container constructor orders snapshot and tombstone filters",
+		 test_heap_container_constructor_orders_snapshot_and_tombstone_filters},
+		{"heap container constructor all future is end",
+		 test_heap_container_constructor_all_future_is_end},
+		{"heap container constructor all deleted is end",
+		 test_heap_container_constructor_all_deleted_is_end},
+		{"heap container constructor empty input",
+		 test_heap_container_constructor_empty_input},
+		{"heap container constructor default snapshot and binary data",
+		 test_heap_container_constructor_default_snapshot_and_binary_data},
+		{"begin filters before first observation",
+		 test_begin_filters_before_first_observation},
+		{"heap increment version modes", test_heap_increment_version_modes},
+		{"heap increment consecutive visible tombstones",
+		 test_heap_increment_consecutive_visible_tombstones},
+		{"heap increment filters future tombstone first",
+		 test_heap_increment_filters_future_tombstone_first},
+		{"heap increment skips future keys and tail",
+		 test_heap_increment_skips_future_keys_and_tail},
+		{"heap increment tombstone between versions",
+		 test_heap_increment_tombstone_between_versions},
 		{"get total size empty", test_get_total_size_empty},
 		{"get total size tracks puts and remove",
 		 test_get_total_size_tracks_puts_and_remove},

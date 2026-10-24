@@ -128,17 +128,18 @@ void test_flush_active_only() {
 }
 
 void test_flush_oldest_frozen_first() {
-	// 每条 21B，两条超过 40B；同一 batch 形成两张 frozen 表。
+	// 每条 21B；每个 batch 结束后只冻结一次，形成两张 frozen SkipList。
 	MemTable table(40);
 	const std::string value(10, 'v');
 	CHECK(table.put_batch({{"a-0", value}, {"a-1", value},
 						   {"a-2", value}, {"a-3", value}}, {1, 2, 3, 4}));
-	CHECK(table.put("b-0", value, 5)._is_add);
-	CHECK(table.get_total_size() == 105);
+	CHECK(table.put_batch({{"b-0", value}, {"b-1", value}}, {5, 6}));
+	CHECK(table.put("c-0", value, 7)._is_add);
+	CHECK(table.get_total_size() == 147);
 
 	const std::vector<std::vector<std::string>> expected = {
-		{"a-0", "a-1"}, {"a-2", "a-3"}, {"b-0"}};
-	std::size_t remaining_bytes = 105;
+		{"a-0", "a-1", "a-2", "a-3"}, {"b-0", "b-1"}, {"c-0"}};
+	std::size_t remaining_bytes = 147;
 	std::uint64_t next_seq = 1;
 	for (std::size_t generation = 0; generation < expected.size(); ++generation) {
 		const std::string path = tmp_path("fifo_" + std::to_string(generation));
@@ -190,7 +191,7 @@ void test_flush_keeps_tombstone() {
 		  entries[0]._seq == 2 && entries[0]._value == "");
 	CHECK(entries[1]._key == "key" && entries[1]._type == Value &&
 		  entries[1]._seq == 1 && entries[1]._value == "value");
-	// tombstone 的 seq 也必须收集（WAL checkpoint 用）
+	// tombstone 记录的 seq 也必须收集。
 	CHECK(flushed_seqs.size() == 2);
 	CHECK(flushed_seqs[0] == 2 && flushed_seqs[1] == 1);
 	rm_tmp(path);

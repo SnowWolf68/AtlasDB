@@ -21,6 +21,7 @@ public:
 	static const std::size_t DEFAULT_MAX_CAPACITY = 32 * 1024;
 	static const std::size_t DEFAULT_KEY_LEN_SIZE = 2;
 	static const std::size_t DEFAULT_VALUE_LEN_SIZE = 2;
+	static const std::uint64_t MAX_COMMIT_SEQUENCE = ((1ULL << 56) - 1);
 
 	Block();
 
@@ -39,7 +40,13 @@ public:
 	get_value(const std::string &enc_key);
 
 	std::optional<BlockIterator> get_exact(const std::string &enc_key);
-	std::optional<BlockIterator> get_lower_bound(const std::string &enc_key);
+	std::optional<BlockIterator>
+	lower_bound_match_user_key(const std::string &enc_key,
+							   bool keep_all_version);
+	std::optional<BlockIterator>
+	lower_bound(const std::string &enc_key,
+				std::optional<std::uint64_t> commit_sequence_opt,
+				bool keep_all_version);
 
 	BlockIterator
 	begin(std::optional<std::uint64_t> commit_sequence = std::nullopt,
@@ -56,8 +63,6 @@ public:
 	iter_monotony_predicate(std::function<int(const std::string &)> predicate,
 							std::optional<std::uint64_t> commit_sequence);
 
-	std::string get_first_key();
-	bool is_first_key();
 	bool empty();
 	std::size_t size() const;
 	std::size_t data_size() const;
@@ -69,19 +74,14 @@ private:
 	std::size_t _cur_size;
 	std::shared_ptr<Comparator<std::string>> _comparator;
 
-
-	static std::vector<std::uint8_t> get_bytes(const std::string &enc_key,
-											   const std::string &value);
-
-	static std::vector<uint8_t> get_bytes_of_uint16t(std::uint16_t num);
-	static std::vector<uint8_t> get_bytes_of_uint32t(std::uint32_t num);
-
 	static std::pair<std::string, std::string>
 	get_kv_at_offset(const std::vector<uint8_t> &data, std::size_t offset);
 
 	std::optional<std::size_t> get_idx_by_enc_key(const std::string &enc_key);
 	std::optional<std::size_t>
 	get_idx_by_enc_key_lower_bound(const std::string &enc_key);
+	std::optional<std::size_t>
+	get_idx_by_enc_key_lower_bound_match_user_key(const std::string &enc_key);
 };
 
 class BlockIterator {
@@ -107,7 +107,7 @@ public:
 private:
 	BlockIterator(std::shared_ptr<Block> block, std::size_t cur_idx,
 				  std::optional<std::uint64_t> commit_sequence,
-				  bool keep_all_version = false);
+				  bool keep_all_version);
 
 	BlockIterator &clean_by_commit_sequence();
 

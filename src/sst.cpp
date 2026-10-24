@@ -24,8 +24,9 @@ bool SSTBuilder::add(const std::string &user_key, const std::string &value,
 					 std::uint64_t commit_sequence, ValueType value_type) {
 	std::string enc_key =
 		InternalKey::encode(InternalKey(user_key, commit_sequence, value_type));
-	if (_block.add_entry(enc_key, value, false)) {
-		if (_block.is_first_key()) { _first_key = enc_key; }
+	if (_block.add_entry(enc_key, value,
+						 false)) { // 先判断如果加入之后容量超了, 就不add
+		if (_block.size() == 1) { _first_key = enc_key; }
 		_last_key = enc_key;
 		return true;
 	}
@@ -34,7 +35,7 @@ bool SSTBuilder::add(const std::string &user_key, const std::string &value,
 		_last_key = enc_key;
 		bool res = _block.add_entry(enc_key, value, true);
 		return res;
-	} else {
+	} else { // 单条记录大小超过了Block的阈值, 需要先force add然后立即刷新flush
 		bool res = _block.add_entry(enc_key, value, true);
 		if (!res) { return false; }
 		_first_key = enc_key;
@@ -89,7 +90,7 @@ std::size_t SSTBuilder::get_estimated_size() {
 	return _data.size() + _block.data_size();
 }
 
-bool SSTBuilder::empty() { return get_estimated_size() == 0 && _block.empty(); }
+bool SSTBuilder::empty() { return get_estimated_size() == 0; }
 
 SST::SST(FileObj file, std::vector<BlockMeta> block_metas,
 		 std::uint32_t meta_section_offset, std::uint64_t sst_id,
@@ -118,18 +119,21 @@ std::shared_ptr<SST> SST::open(const std::string &path, std::uint64_t sst_id) {
 			return nullptr;
 		}
 		std::uint32_t meta_section_offset = file.read_uint32(file_size - 5);
+		if (meta_section_offset > file_size - 5) { return nullptr; }
 		std::vector<std::uint8_t> block_meta_data =
 			file.read(meta_section_offset, file_size - meta_section_offset - 5);
 		std::optional<std::vector<BlockMeta>> block_meta_optional =
 			BlockMeta::decode(block_meta_data);
 		if (block_meta_optional == std::nullopt) { return nullptr; }
+		std::vector<BlockMeta> block_metas = block_meta_optional.value();
+		if (block_metas.empty()) { return nullptr; }
 		std::string first_key = block_meta_optional.value()[0]._first_key;
 		std::string last_key =
 			block_meta_optional.value()[block_meta_optional.value().size() - 1]
 				._last_key;
-		return std::make_shared<SST>(
-			std::move(file), block_meta_optional.value(), meta_section_offset,
-			sst_id, first_key, last_key);
+		return std::make_shared<SST>(std::move(file), block_metas,
+									 meta_section_offset, sst_id, first_key,
+									 last_key);
 	} catch (const std::exception &e) {
 		LOG(Log::ERROR) << e.what();
 		return nullptr;
@@ -147,6 +151,12 @@ std::shared_ptr<Block> SST::read_block(std::size_t block_idx) const {
 			block_idx == _block_metas.size() - 1
 				? _meta_section_offset
 				: _block_metas[block_idx + 1]._offset;
+		if (block_start_offset > _file.size() ||
+			block_end_offset > _file.size() ||
+			block_start_offset > block_end_offset ||
+			block_end_offset > _meta_section_offset) {
+			return nullptr;
+		}
 		std::vector<std::uint8_t> block_data = _file.read(
 			block_start_offset, block_end_offset - block_start_offset);
 		return Block::decode(block_data, true);
@@ -180,7 +190,7 @@ std::optional<SSTIterator> SST::get(const std::string &enc_key) const {
 	std::shared_ptr<Block> block = read_block(block_idx_opt.value());
 	if (block == nullptr) { return std::nullopt; }
 	std::optional<BlockIterator> block_iter_opt =
-		block->get_lower_bound(enc_key);
+		block->lower_bound_match_user_key(enc_key, false);
 	if (block_iter_opt == std::nullopt) { return std::nullopt; }
 	return SSTIterator(shared_from_this(), block_idx_opt.value(),
 					   block_iter_opt.value());

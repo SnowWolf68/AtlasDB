@@ -40,6 +40,10 @@ public:
 	HeapIterator(bool skip_tombstone, std::uint64_t commit_sequence,
 				 bool keep_all_version = false);
 
+	HeapIterator(std::vector<HeapItem> heap, bool skip_tombstone,
+				 bool keep_all_version,
+				 std::optional<std::uint64_t> commit_sequence = std::nullopt);
+
 	void put(const std::string &user_key, const std::string &value,
 			 std::uint64_t commit_sequence, ValueType value_type);
 	void put(const std::string &enc_key, const std::string &value);
@@ -57,15 +61,13 @@ public:
 	void set_keep_all_version(bool keep_all_version);
 
 private:
-	HeapIterator &clean_tombstone();
-	HeapIterator &clean_by_commit_sequence();
-
-
 	std::priority_queue<HeapItem, std::vector<HeapItem>, std::greater<HeapItem>>
 		_heap;
-	bool _skip_tombstone;
-	std::uint64_t _commit_sequence;
-	bool _keep_all_version;
+	bool _skip_tombstone;			// 是否需要跳过已经删除的key
+	std::uint64_t _commit_sequence; // 过滤key的commit_sequence
+	bool
+		_keep_all_version; // 是否遍历一个key的所有版本,
+						   // 还是只返回第一个小于等于过滤的commit_seqence的第一个key
 };
 
 class MemTable {

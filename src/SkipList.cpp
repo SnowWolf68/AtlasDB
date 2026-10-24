@@ -106,31 +106,17 @@ Note: 但是有可能会返回_head
 const SkipListNode *SkipList::find_or_prev(const std::string &key) const {
 	int level_idx = _head._next.size() - 1;
 	const SkipListNode *p = &_head;
-	while (level_idx > 0) {
+	while (level_idx >= 0) {
 		while (p->_next[level_idx] != nullptr &&
 			   (*_cmp)(p->_next[level_idx]->_key, key) < 0) {
 			p = p->_next[level_idx];
-		}
-		if (p->_next[level_idx] != nullptr &&
-			(*_cmp)(p->_next[level_idx]->_key, key) == 0) {
-			break;
 		}
 		level_idx--;
 	}
-	if (level_idx != 0) {
-		return p->_next[level_idx];
-	} else {
-		while (p->_next[level_idx] != nullptr &&
-			   (*_cmp)(p->_next[level_idx]->_key, key) < 0) {
-			p = p->_next[level_idx];
-		}
-		if (p->_next[level_idx] != nullptr &&
-			(*_cmp)(p->_next[level_idx]->_key, key) == 0) {
-			return p->_next[level_idx];
-		} else {
-			return p;
-		}
+	if (p->_next[0] != nullptr && (*_cmp)(p->_next[0]->_key, key) == 0) {
+		return p->_next[0];
 	}
+	return p; // 这里的p仍然可能是_head
 }
 
 /**
@@ -184,7 +170,8 @@ bool SkipList::put(std::string key, std::string value) {
 		return false;
 	} else {
 		// insert, find_res为其前驱, find_res有可能是head, 但是没有影响
-		int new_node_level = get_level(SkipList::MAX_LEVEL);
+		int new_node_level = get_level(
+			SkipList::MAX_LEVEL); // new_node_level这里其实是层的下标, 不是层数
 		SkipListNode *new_node = new SkipListNode(key, value, new_node_level);
 		new_node->_next[0] = find_res->_next[0];
 		find_res->_next[0] = new_node; // level_idx = 0修改完毕
@@ -342,7 +329,7 @@ SkipList::preffix_raw_string(const std::string &key) {
 	level_idx = _head._next.size() - 1;
 	while (level_idx >= 0) {
 		while (p->_next[level_idx] != nullptr &&
-			   (*_cmp)(p->_next[level_idx]->_key, next_key) <= 0) {
+			   (*_cmp)(p->_next[level_idx]->_key, next_key) < 0) {
 			p = p->_next[level_idx];
 		}
 		level_idx--;

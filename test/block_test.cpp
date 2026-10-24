@@ -1,5 +1,6 @@
 #include "Block.h"
 #include "Comparator.h"
+#include "binary_test_helpers.h"
 
 #include <cstdint>
 #include <exception>
@@ -7,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -134,18 +136,19 @@ void test_crc_mismatch_returns_null() {
 }
 
 void test_corrupted_num_elements_returns_null() {
-	// Create minimal valid data, then corrupt
-	Block block;
-	auto encoded = block.encode(false);
-
-	if (encoded.size() >= 2) {
-		encoded[encoded.size() - 1] = 0xFF;
+	for (bool with_crc : {false, true}) {
+		// Both zero available offset bytes and a partially available table.
+		for (const auto &payload : std::vector<std::vector<std::uint8_t>>{{}, {0}}) {
+			auto bytes = binary_test::block_bytes(payload, {}, with_crc);
+			const std::size_t count_pos = bytes.size() - (with_crc ? 6 : 2);
+			for (std::uint16_t count : {1, 65535}) {
+				auto malformed = bytes;
+				binary_test::overwrite_u16(malformed, count_pos, count);
+				if (with_crc) { binary_test::refresh_crc(malformed); }
+				CHECK(Block::decode(malformed, with_crc) == nullptr);
+			}
+		}
 	}
-
-	// This might cause out-of-bounds; decode should handle gracefully
-	auto decoded = Block::decode(encoded, false);
-	// If it returns non-null, that's ok too as long as it doesn't crash
-	(void)decoded;
 }
 
 // ─── binary data ────────────────────────────────────────────────
@@ -299,6 +302,193 @@ std::shared_ptr<Block> make_encoded_block(
 		CHECK(block->add_entry(enc(user_keys[i], seqs[i]), values[i], false));
 	}
 	return block;
+}
+
+void check_block_position(const std::optional<BlockIterator> &result,
+						  const std::string &key, std::uint64_t seq,
+						  const std::string &value, ValueType type = Value) {
+	CHECK(result.has_value());
+	CHECK(result->is_valid());
+	CHECK((**result).first == InternalKey::encode(InternalKey(key, seq, type)));
+	CHECK((**result).second == value);
+}
+
+void check_block_range(BlockIterator it, const BlockIterator &end,
+					   const std::vector<std::pair<std::string, std::string>> &expected) {
+	// Bound traversal by the expected count so an incorrect end sentinel fails
+	// instead of turning the test into an unbounded loop.
+	for (const auto &entry : expected) {
+		CHECK(it != end);
+		CHECK(it.is_valid());
+		CHECK(*it == entry);
+		++it;
+	}
+	CHECK(it == end);
+}
+
+void test_lower_bound_empty_and_past_end() {
+	auto empty = std::make_shared<Block>();
+	auto block = make_encoded_block({"b"}, {10}, {"value"});
+	for (bool keep_all : {false, true}) {
+		CHECK(!empty->lower_bound(enc("a", 10), std::nullopt, keep_all));
+		CHECK(!empty->lower_bound_match_user_key(enc("a", 10), keep_all));
+		CHECK(!block->lower_bound(enc("z", 10), std::nullopt, keep_all));
+		CHECK(!block->lower_bound(enc("b", 5), std::nullopt, keep_all));
+		check_block_position(block->lower_bound(enc("b", 10), 10, keep_all),
+			"b", 10, "value");
+	}
+}
+
+void test_lower_bound_allows_different_user_key() {
+	auto block = make_encoded_block({"b", "d"}, {20, 5}, {"new-b", "old-d"});
+	for (bool keep_all : {false, true}) {
+		// The timestamp in the seek key must not become an implicit snapshot.
+		check_block_position(block->lower_bound(enc("a", 1), std::nullopt, keep_all),
+			"b", 20, "new-b");
+		check_block_position(block->lower_bound(enc("a", 1), 10, keep_all),
+			"d", 5, "old-d");
+		CHECK(!block->lower_bound_match_user_key(enc("a", 1), keep_all));
+	}
+}
+
+void test_lower_bound_seek_and_snapshot_are_independent() {
+	auto block = make_encoded_block({"a", "a", "a", "b"}, {30, 20, 10, 5},
+		{"a30", "a20", "a10", "b5"});
+	for (bool keep_all : {false, true}) {
+		// A loose snapshot cannot move the result before the requested seek key.
+		check_block_position(block->lower_bound(enc("a", 25), 100, keep_all),
+			"a", 20, "a20");
+		check_block_position(block->lower_bound(enc("a", 25), std::nullopt, keep_all),
+			"a", 20, "a20");
+		// A strict snapshot may move the result after that initial position.
+		check_block_position(block->lower_bound(enc("a", 100), 15, keep_all),
+			"a", 10, "a10");
+	}
+}
+
+void test_lower_bound_filtered_to_end_returns_nullopt() {
+	auto block = make_encoded_block({"b", "c"}, {20, 30}, {"b20", "c30"});
+	for (bool keep_all : {false, true}) {
+		// The raw lower_bound exists, but no record survives snapshot filtering.
+		CHECK(!block->lower_bound(enc("a", 100), 10, keep_all));
+		CHECK(!block->lower_bound(enc("b", 100), 10, keep_all));
+		auto result = block->lower_bound(enc("a", 100), 20, keep_all);
+		check_block_position(result, "b", 20, "b20");
+		check_block_range(*result, block->end(), {{enc("b", 20), "b20"}});
+	}
+}
+
+void test_lower_bound_version_modes_preserve_tombstones() {
+	auto block = std::make_shared<Block>();
+	const auto tombstone = InternalKey::encode(InternalKey("a", 30, TombStone));
+	CHECK(block->add_entry(tombstone, "", false));
+	CHECK(block->add_entry(enc("a", 20), "old", false));
+	CHECK(block->add_entry(enc("b", 5), "", false));
+	for (bool keep_all : {false, true}) {
+		auto result = block->lower_bound(enc("a", 100), std::nullopt, keep_all);
+		check_block_position(result, "a", 30, "", TombStone);
+		std::vector<std::pair<std::string, std::string>> expected{{tombstone, ""}};
+		if (keep_all) { expected.push_back({enc("a", 20), "old"}); }
+		expected.push_back({enc("b", 5), ""});
+		check_block_range(*result, block->end(), expected);
+		check_block_position(block->lower_bound(enc("a", 100), 25, keep_all),
+			"a", 20, "old");
+	}
+}
+
+void test_matching_lower_bound_rejects_other_keys() {
+	auto block = make_encoded_block({"a", "a", "a", "c"}, {30, 10, 5, 4},
+		{"a30", "a10", "a5", "c4"});
+	for (bool keep_all : {false, true}) {
+		auto result = block->lower_bound_match_user_key(enc("a", 20), keep_all);
+		check_block_position(result, "a", 10, "a10");
+		std::vector<std::pair<std::string, std::string>> expected{{enc("a", 10), "a10"}};
+		if (keep_all) { expected.push_back({enc("a", 5), "a5"}); }
+		expected.push_back({enc("c", 4), "c4"});
+		check_block_range(*result, block->end(), expected);
+		CHECK(!block->lower_bound_match_user_key(enc("a", 4), keep_all));
+		CHECK(!block->lower_bound_match_user_key(enc("b", 100), keep_all));
+		CHECK(!block->lower_bound_match_user_key(enc("z", 100), keep_all));
+		check_block_position(block->lower_bound(enc("b", 100), 100, keep_all),
+			"c", 4, "c4");
+	}
+}
+
+void test_prefix_snapshot_filters_both_boundaries() {
+	auto block = make_encoded_block(
+		{"app", "app", "apple", "apple", "application", "apq", "apq", "banana"},
+		{30, 10, 40, 15, 50, 35, 5, 4},
+		{"app30", "app10", "apple40", "apple15", "future", "apq35", "apq5", "b4"});
+	auto range = block->preffix("app", 20);
+	check_block_range(range.first, range.second,
+		{{enc("app", 10), "app10"}, {enc("apple", 15), "apple15"}});
+	CHECK(range.second.is_valid());
+	CHECK((*range.second).first == enc("apq", 5));
+	range = block->preffix("app", 35);
+	check_block_range(range.first, range.second,
+		{{enc("app", 30), "app30"}, {enc("apple", 15), "apple15"}});
+	CHECK((*range.second).first == enc("apq", 35));
+}
+
+void test_prefix_missing_literal_boundaries() {
+	auto block = make_encoded_block(
+		{"apple", "apple", "application", "apricot", "banana"},
+		{30, 10, 5, 40, 3}, {"future", "apple10", "application5", "future", "b3"});
+	// Neither literal boundary (app/apq) exists as a user key.
+	auto range = block->preffix("app", 20);
+	check_block_range(range.first, range.second,
+		{{enc("apple", 10), "apple10"}, {enc("application", 5), "application5"}});
+	CHECK((*range.second).first == enc("banana", 3));
+	// A gap before the final key is an empty range, not a prefix match.
+	range = block->preffix("apq", 20);
+	CHECK(range.first == range.second);
+	CHECK(range.second.is_valid());
+	CHECK((*range.second).first == enc("banana", 3));
+}
+
+void test_prefix_all_future_returns_block_end_pair() {
+	auto block = make_encoded_block({"apple", "application", "banana"},
+		{30, 40, 50}, {"a30", "a40", "b50"});
+	const auto range = block->preffix("app", 10);
+	CHECK(range.first == block->end());
+	CHECK(range.second == block->end());
+	CHECK(!range.first.is_valid());
+	CHECK(range.first != BlockIterator::invalid_iter());
+}
+
+void test_prefix_missing_or_filtered_upper_bound_reaches_end() {
+	for (bool add_future_tail : {false, true}) {
+		auto block = make_encoded_block({"app", "apple"}, {5, 6}, {"app5", "apple6"});
+		if (add_future_tail) {
+			CHECK(block->add_entry(enc("apq", 30), "future-apq", false));
+			CHECK(block->add_entry(enc("banana", 40), "future-banana", false));
+		}
+		const auto range = block->preffix("app", 10);
+		CHECK(range.second == block->end());
+		check_block_range(range.first, range.second,
+			{{enc("app", 5), "app5"}, {enc("apple", 6), "apple6"}});
+	}
+}
+
+void test_prefix_binary_and_empty_prefix_with_snapshot() {
+	const std::string x("a\0x", 3), y("a\0y", 3);
+	const std::string ff0("\xff\0", 2), ffff("\xff\xff", 2);
+	const std::string binary_value("v\0\xff", 3);
+	auto block = make_encoded_block(
+		{"", x, x, y, "b", ff0, ff0, ffff},
+		{0, 10, 3, 4, 2, 10, 3, 4},
+		{"", "future", binary_value, "y4", "b2", "future", "ff3", "ff4"});
+	auto range = block->preffix(std::string("a\0", 2), 5);
+	check_block_range(range.first, range.second,
+		{{enc(x, 3), binary_value}, {enc(y, 4), "y4"}});
+	range = block->preffix(std::string("\xff", 1), 5);
+	CHECK(range.second == block->end());
+	check_block_range(range.first, range.second,
+		{{enc(ff0, 3), "ff3"}, {enc(ffff, 4), "ff4"}});
+	range = block->preffix("", 5);
+	check_block_range(range.first, range.second,
+		{{enc("", 0), ""}, {enc(x, 3), binary_value}, {enc(y, 4), "y4"},
+		 {enc("b", 2), "b2"}, {enc(ff0, 3), "ff3"}, {enc(ffff, 4), "ff4"}});
 }
 
 void test_prefix_basic() {
@@ -557,6 +747,214 @@ void test_exact_lookup_multiple_entry_boundaries() {
 	}
 }
 
+template <typename Function>
+void check_throws_length_rejection(Function &&function) {
+	bool threw = false;
+	try { function(); }
+	catch (const std::length_error &) { threw = true; }
+	catch (const std::runtime_error &) { threw = true; }
+	CHECK(threw);
+}
+
+void test_maximum_enc_key_length_is_representable() {
+	const std::string key = enc(std::string(65535 - 8, 'k'), 1);
+	const std::string value("v\0\xff", 3);
+	CHECK(key.size() == 65535);
+	Block block;
+	// A representable entry may exceed the block's target capacity. This is a
+	// normal capacity failure, and force must allow it without truncation.
+	CHECK(!block.add_entry(key, value, false));
+	CHECK(block.empty() && block.size() == 0 && block.data_size() == 0);
+	CHECK(block.add_entry(key, value, true));
+	const auto bytes = block.encode(false);
+	CHECK(bytes[0] == 0xff && bytes[1] == 0xff);
+	for (bool with_crc : {false, true}) {
+		auto decoded = Block::decode(block.encode(with_crc), with_crc);
+		CHECK(decoded != nullptr);
+		CHECK(decoded->size() == 1);
+		check_block_range(decoded->begin(std::nullopt, true), decoded->end(),
+			{{key, value}});
+	}
+}
+
+void test_maximum_value_length_is_representable() {
+	const std::string key = enc("key", 1);
+	std::string value(65535, 'v');
+	value.front() = '\0';
+	value[100] = static_cast<char>(0xff);
+	value.back() = '\0';
+	Block block;
+	CHECK(!block.add_entry(key, value, false));
+	CHECK(block.empty() && block.size() == 0 && block.data_size() == 0);
+	CHECK(block.add_entry(key, value, true));
+	const auto bytes = block.encode(false);
+	const auto value_length_pos = 2 + key.size();
+	CHECK(bytes[value_length_pos] == 0xff && bytes[value_length_pos + 1] == 0xff);
+	for (bool with_crc : {false, true}) {
+		auto decoded = Block::decode(block.encode(with_crc), with_crc);
+		CHECK(decoded != nullptr);
+		CHECK(decoded->size() == 1);
+		check_block_range(decoded->begin(std::nullopt, true), decoded->end(),
+			{{key, value}});
+	}
+}
+
+template <bool OversizedKey>
+void check_oversized_entry_throws_before_mutation() {
+	const std::string key = OversizedKey
+		? enc(std::string(65536 - 8, 'z'), 2) : enc("z", 2);
+	const std::string value = OversizedKey ? "value" : std::string(65536, 'v');
+	for (bool force : {false, true}) {
+		for (bool has_existing_entry : {false, true}) {
+			Block block;
+			if (has_existing_entry) { CHECK(block.add_entry(enc("a", 1), "ok", false)); }
+			const auto before_size = block.size();
+			const auto before_data_size = block.data_size();
+			const auto before_bytes = block.encode(true);
+			check_throws_length_rejection([&] { block.add_entry(key, value, force); });
+			CHECK(block.size() == before_size);
+			CHECK(block.data_size() == before_data_size);
+			CHECK(block.encode(true) == before_bytes);
+			// Rejection must leave the block usable for another valid record.
+			CHECK(block.add_entry(enc("b", 3), "after", false));
+			auto decoded = Block::decode(block.encode(true), true);
+			CHECK(decoded != nullptr);
+			std::vector<std::pair<std::string, std::string>> expected;
+			if (has_existing_entry) { expected.push_back({enc("a", 1), "ok"}); }
+			expected.push_back({enc("b", 3), "after"});
+			check_block_range(decoded->begin(std::nullopt, true), decoded->end(), expected);
+		}
+	}
+}
+
+void test_oversized_enc_key_throws_before_mutation() {
+	check_oversized_entry_throws_before_mutation<true>();
+}
+
+void test_oversized_value_throws_before_mutation() {
+	check_oversized_entry_throws_before_mutation<false>();
+}
+
+void test_decode_rejects_truncated_headers() {
+	for (bool with_crc : {false, true}) {
+		const std::size_t minimum = with_crc ? 6 : 2;
+		for (std::size_t length = 0; length < minimum; ++length) {
+			CHECK(Block::decode(std::vector<std::uint8_t>(length), with_crc) == nullptr);
+		}
+		auto empty = Block::decode(binary_test::block_bytes({}, {}, with_crc), with_crc);
+		CHECK(empty != nullptr);
+		CHECK(empty->empty() && empty->size() == 0);
+		CHECK(empty->begin() == empty->end());
+	}
+}
+
+void test_decode_rejects_offsets_at_or_beyond_data_end() {
+	for (bool with_crc : {false, true}) {
+		CHECK(Block::decode(binary_test::block_bytes({}, {0}, with_crc), with_crc) == nullptr);
+		auto block = make_block_with_data({"a"}, {"value"});
+		const auto data_end = block->data_size();
+		for (auto invalid_offset : {data_end, data_end + 1, std::size_t{65535}}) {
+			auto bytes = block->encode(with_crc);
+			binary_test::overwrite_u16(bytes, data_end,
+				static_cast<std::uint16_t>(invalid_offset));
+			if (with_crc) { binary_test::refresh_crc(bytes); }
+			CHECK(Block::decode(bytes, with_crc) == nullptr);
+		}
+	}
+}
+
+void test_decode_rejects_duplicate_offsets() {
+	auto block = make_block_with_data({"a", "b"}, {"one", "two"});
+	for (bool with_crc : {false, true}) {
+		auto bytes = block->encode(with_crc);
+		binary_test::overwrite_u16(bytes, block->data_size() + 2, 0);
+		if (with_crc) { binary_test::refresh_crc(bytes); }
+		CHECK(Block::decode(bytes, with_crc) == nullptr);
+	}
+}
+
+void test_decode_rejects_descending_offsets() {
+	auto block = make_block_with_data({"a", "b", "c"}, {"one", "two", "three"});
+	const std::uint16_t second_offset = 2 + enc("a", 10).size() + 2 + 3;
+	for (bool with_crc : {false, true}) {
+		auto bytes = block->encode(with_crc);
+		// Keep all offsets in range and distinct; only their order is invalid.
+		binary_test::overwrite_u16(bytes, block->data_size() + 4, second_offset - 1);
+		if (with_crc) { binary_test::refresh_crc(bytes); }
+		CHECK(Block::decode(bytes, with_crc) == nullptr);
+	}
+}
+
+void check_incomplete_record_throws_when_read(const std::vector<std::uint8_t> &payload) {
+	for (bool with_crc : {false, true}) {
+		auto block = Block::decode(binary_test::block_bytes(payload, {0}, with_crc), with_crc);
+		// Decode validates the table structure; record contents are checked on access.
+		CHECK(block != nullptr);
+		auto it = block->begin(std::nullopt, true);
+		CHECK(it.is_valid());
+		bool threw = false;
+		try { (void)*it; }
+		catch (const std::runtime_error &) { threw = true; }
+		CHECK(threw);
+	}
+}
+
+void test_read_rejects_incomplete_key_length() {
+	check_incomplete_record_throws_when_read({0});
+}
+
+void test_read_rejects_truncated_key() {
+	check_incomplete_record_throws_when_read({0, 10, 'a'});
+}
+
+void test_read_rejects_incomplete_value_length() {
+	check_incomplete_record_throws_when_read({0, 1, 'a', 0});
+}
+
+void test_read_rejects_truncated_value() {
+	check_incomplete_record_throws_when_read({0, 1, 'a', 0, 4, 'b'});
+}
+
+void test_maximum_entry_offset_and_next_forced_append() {
+	Block block;
+	const auto first_key = enc("a", 1);
+	const auto second_key = enc("b", 1);
+	const std::string first_value(65535 - 4 - first_key.size(), 'v');
+	const std::string second_value("\0\xff", 2);
+	CHECK(block.add_entry(first_key, first_value, true));
+	CHECK(block.data_size() == 65535);
+	CHECK(block.add_entry(second_key, second_value, true));
+	CHECK(block.data_size() > 65535);
+	const auto before = block.encode(true);
+	const auto before_size = block.data_size();
+	// Ordinary capacity rejection must still let SSTBuilder switch blocks.
+	CHECK(!block.add_entry(enc("c", 1), "after", false));
+	CHECK(block.encode(true) == before);
+	check_throws_length_rejection([&] { block.add_entry(enc("c", 1), "after", true); });
+	CHECK(block.size() == 2 && block.data_size() == before_size);
+	CHECK(block.encode(true) == before);
+	for (bool with_crc : {false, true}) {
+		const auto bytes = block.encode(with_crc);
+		CHECK(bytes[before_size + 2] == 0xff && bytes[before_size + 3] == 0xff);
+		auto decoded = Block::decode(bytes, with_crc);
+		CHECK(decoded != nullptr && decoded->size() == 2);
+		check_block_range(decoded->begin(std::nullopt, true), decoded->end(),
+			{{first_key, first_value}, {second_key, second_value}});
+	}
+}
+
+void test_entry_count_limit_rejects_before_mutation() {
+	// The public constructor permits seeding metadata. Isolate the count guard
+	// here: ordinary appends reach the byte-offset limit before this count.
+	Block block({}, std::vector<std::uint16_t>(65535, 0), 0);
+	const auto before = block.encode(true);
+	for (bool force : {false, true}) {
+		check_throws_length_rejection([&] { block.add_entry(enc("key", 1), "value", force); });
+		CHECK(block.size() == 65535 && block.data_size() == 0);
+		CHECK(block.encode(true) == before);
+	}
+}
+
 // ─── test runner ────────────────────────────────────────────────
 
 struct TestCase {
@@ -575,8 +973,23 @@ int main() {
 		{"capacity rejects when full",
 		 test_capacity_rejects_when_full},
 		{"force write", test_force_write},
+		{"maximum enc key length is representable", test_maximum_enc_key_length_is_representable},
+		{"maximum value length is representable", test_maximum_value_length_is_representable},
+		{"oversized enc key throws before mutation", test_oversized_enc_key_throws_before_mutation},
+		{"oversized value throws before mutation", test_oversized_value_throws_before_mutation},
 		{"crc mismatch returns null",
 		 test_crc_mismatch_returns_null},
+		{"corrupted entry count returns null", test_corrupted_num_elements_returns_null},
+		{"decode rejects truncated headers", test_decode_rejects_truncated_headers},
+		{"decode rejects offsets at or beyond data end", test_decode_rejects_offsets_at_or_beyond_data_end},
+		{"decode rejects duplicate offsets", test_decode_rejects_duplicate_offsets},
+		{"decode rejects descending offsets", test_decode_rejects_descending_offsets},
+		{"read rejects incomplete key length", test_read_rejects_incomplete_key_length},
+		{"read rejects truncated key", test_read_rejects_truncated_key},
+		{"read rejects incomplete value length", test_read_rejects_incomplete_value_length},
+		{"read rejects truncated value", test_read_rejects_truncated_value},
+		{"maximum entry offset and next forced append", test_maximum_entry_offset_and_next_forced_append},
+		{"entry count limit rejects before mutation", test_entry_count_limit_rejects_before_mutation},
 		{"binary keys", test_binary_keys},
 		{"large values", test_large_values},
 		{"encode size increases with entries",
@@ -592,6 +1005,17 @@ int main() {
 		 test_iterator_operator_star_after_end_asserts},
 		{"iterator begin end is valid",
 		 test_iterator_begin_end_is_valid},
+		{"lower bound empty and past end", test_lower_bound_empty_and_past_end},
+		{"lower bound allows different user key", test_lower_bound_allows_different_user_key},
+		{"lower bound seek and snapshot are independent", test_lower_bound_seek_and_snapshot_are_independent},
+		{"lower bound filtered to end returns nullopt", test_lower_bound_filtered_to_end_returns_nullopt},
+		{"lower bound version modes preserve tombstones", test_lower_bound_version_modes_preserve_tombstones},
+		{"matching lower bound rejects other keys", test_matching_lower_bound_rejects_other_keys},
+		{"prefix snapshot filters both boundaries", test_prefix_snapshot_filters_both_boundaries},
+		{"prefix missing literal boundaries", test_prefix_missing_literal_boundaries},
+		{"prefix all future returns block end pair", test_prefix_all_future_returns_block_end_pair},
+		{"prefix missing or filtered upper bound reaches end", test_prefix_missing_or_filtered_upper_bound_reaches_end},
+		{"prefix binary and empty prefix with snapshot", test_prefix_binary_and_empty_prefix_with_snapshot},
 		{"prefix basic", test_prefix_basic},
 		{"prefix single match", test_prefix_single_match},
 		{"prefix no match", test_prefix_no_match},

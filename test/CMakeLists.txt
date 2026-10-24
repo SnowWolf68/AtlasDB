@@ -3,6 +3,7 @@ set(
 	skiplist_test
 	skiplist_iterator_test
 	internal_key_test
+	codec_test
 	memtable_test
 	block_test
 	blockmeta_test
@@ -44,7 +45,7 @@ list(APPEND ATLASDB_TEST_TARGETS ${ATLASDB_NET_TEST_TARGETS})
 # Linux-only review/integration tests use GNU ld syscall wrapping and /proc
 # for scoped WAL fault injection. Other platforms skip these targets.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-	list(APPEND ATLASDB_TEST_TARGETS transaction_review_test atlasserver_test lsm_del_test file_read_test)
+	list(APPEND ATLASDB_TEST_TARGETS transaction_review_test atlasserver_test lsm_del_test file_read_test memtable_flush_regression_test memtable_begin_regression_test)
 endif()
 
 foreach(test_target IN LISTS ATLASDB_TEST_TARGETS)
@@ -77,6 +78,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		"-Wl,--wrap=bind" "-Wl,--wrap=accept4" "-Wl,--wrap=read" "-Wl,--wrap=write")
 	target_link_options(lsm_del_test PRIVATE "-Wl,--wrap=write")
 	target_link_options(file_read_test PRIVATE "-Wl,--wrap=lseek" "-Wl,--wrap=pread")
+	target_link_options(memtable_flush_regression_test PRIVATE
+		"-Wl,--wrap=fsync"
+		"-Wl,--wrap=pthread_rwlock_rdlock" "-Wl,--wrap=pthread_rwlock_wrlock"
+		"-Wl,--wrap=_ZN8SkipListC1ESt10shared_ptrIK10ComparatorINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEEEi")
+	set_tests_properties(memtable_flush_regression_test PROPERTIES TIMEOUT 110)
+	target_link_options(memtable_begin_regression_test PRIVATE
+		"-Wl,--wrap=pthread_rwlock_rdlock" "-Wl,--wrap=pthread_rwlock_wrlock")
+	set_tests_properties(memtable_begin_regression_test PROPERTIES TIMEOUT 40)
 	target_compile_definitions(scan_test PRIVATE ATLASDB_SCAN_LOCK_CHECK=1)
 	target_link_options(scan_test PRIVATE
 		"-Wl,--wrap=pthread_rwlock_rdlock" "-Wl,--wrap=pthread_rwlock_unlock")

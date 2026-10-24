@@ -1,5 +1,7 @@
 #include "MemTable.h"
 #include "Record.h"
+#include "log.h"
+
 #include <cassert>
 #include <limits>
 #include <mutex>
@@ -222,9 +224,6 @@ bool MemTable::put_batch(std::vector<std::pair<std::string, std::string>> kvs,
 			// res == true: 添加
 			// 更新 active_bytes
 			_active_bytes += key.size() + value.size() + SEQ_AND_VALTYPE_SIZE;
-			if (_active_bytes > _max_active_bytes) {
-				froze_with_active_unique();
-			}
 		} else {
 			// res == false: 更新
 			// 理论上正常情况好像走不到这里, 走的都是添加的逻辑
@@ -232,11 +231,9 @@ bool MemTable::put_batch(std::vector<std::pair<std::string, std::string>> kvs,
 			int old_value_bytes = value_opt.value().size(),
 				cur_size = value.size();
 			_active_bytes += (cur_size - old_value_bytes);
-			if (_active_bytes > _max_active_bytes) {
-				froze_with_active_unique();
-			}
 		}
 	}
+	if (_active_bytes > _max_active_bytes) { froze_with_active_unique(); }
 	return true;
 }
 
@@ -344,6 +341,18 @@ HeapIterator::HeapIterator(bool skip_tombstone, std::uint64_t commit_sequence,
 	: _skip_tombstone(skip_tombstone), _commit_sequence(commit_sequence),
 	  _keep_all_version(keep_all_version) {}
 
+HeapIterator::HeapIterator(std::vector<HeapItem> heap, bool skip_tombstone,
+						   bool keep_all_version,
+						   std::optional<std::uint64_t> commit_sequence)
+	: _heap(std::greater<HeapItem>{}, std::move(heap)),
+	  _skip_tombstone(skip_tombstone), _commit_sequence(MAX_COMMIT_SEQUENCE),
+	  _keep_all_version(keep_all_version) {
+	if (commit_sequence != std::nullopt) {
+		_commit_sequence = commit_sequence.value();
+	}
+	clean_after_operate();
+}
+
 /**
 Compare定义的是 "比对方小/大" 的意思
 std::less/std::greater 定义的是 "选用大顶堆/小顶堆"
@@ -357,13 +366,6 @@ bool HeapIterator::HeapItem::operator>(const HeapItem &other) const {
 		   0;
 }
 
-HeapIterator &HeapIterator::clean_by_commit_sequence() {
-	while (!_heap.empty() && _heap.top()._commit_sequence > _commit_sequence) {
-		_heap.pop();
-	}
-	return *this;
-}
-
 void HeapIterator::put(const std::string &user_key, const std::string &value,
 					   std::uint64_t commit_sequence, ValueType value_type) {
 	HeapItem item(user_key, value, commit_sequence, value_type);
@@ -375,42 +377,61 @@ void HeapIterator::put(const std::string &enc_key, const std::string &value) {
 	put(intr_key._key, value, intr_key._commit_sequence, intr_key._value_type);
 }
 
+/**
+ * 其实主要分为两部分, 一个是怎么才能把当前的跳过去,
+ * 一个是找下一个的过程中需要怎么过滤
+ *
+ *	1. (怎么把当前的跳过去) 先判断keep_all_version:
+ *		1. 如果keep == true, 那么直接弹出堆顶, 然后看下一个
+ *		2. 如果keep == false,
+ *			那么先保存当前的user_key, 然后把所有相同user_key的全弹掉,
+ *			然后看下一个
+ *	2. (找下一个的过程中要怎么过滤) 对于新走到的这个数据, 还需要进行过滤:
+ *		过滤顺序为:
+ *		1. 先过滤commit_sequence
+ *		2. 然后看看是不是需要skip_tombstone
+ *			1. 如果需要skip
+ *				1. 并且当前第一个就是tombstone,
+ *				那么接着把所有相同的user_key全跳过去, 然后重新走整体的第二个流程
+ *							(对于新走到的这个数据, 还需要进行过滤: )
+ *				2. 如果当前第一个不是tombstone,
+ *					那么下一个就是当前这个了, 可以返回了
+ *			2. 如果不需要skip
+ *				也是可以直接返回了
+ *
+ * @return
+ */
 HeapIterator &HeapIterator::operator++() {
+	// 1.
 	if (_heap.empty()) { return *this; }
-	HeapItem top = _heap.top();
-	_heap.pop();
-	if (!_keep_all_version) {
-		while (!_heap.empty() && _heap.top()._key == top._key) {
+	if (_keep_all_version) {
+		_heap.pop();
+	} else {
+		std::string user_key = _heap.top()._key;
+		_heap.pop();
+		while (!_heap.empty() && _heap.top()._key == user_key) {
 			_heap.pop();
 		}
 	}
+	// 2.
 	clean_after_operate();
-	// clean_by_commit_sequence();
-	// if (_skip_tombstone) { clean_tombstone(); }
 	return *this;
 }
 
 HeapIterator MemTable::begin(std::optional<std::uint64_t> commit_sequence_opt,
-							 bool keep_all_version, bool skip_tombston) const {
-	std::uint64_t commit_sequence = MAX_COMMIT_SEQUENCE;
-	if (commit_sequence_opt != std::nullopt) {
-		commit_sequence = commit_sequence_opt.value();
-	}
-	HeapIterator heap_iterator(skip_tombston, commit_sequence,
-							   keep_all_version);
+							 bool keep_all_version, bool skip_tombstone) const {
+	std::vector<HeapIterator::HeapItem> heap;
 	{
 		std::shared_lock<std::shared_mutex> active_shared(_active_mutex);
+		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
 		for (SkipList::ConstIterator it = _active_list->begin();
 			 it != _active_list->end(); ++it) {
 			InternalKey intr_key = InternalKey::decode(it.key());
 			HeapIterator::HeapItem item(intr_key._key, it.value(),
 										intr_key._commit_sequence,
 										intr_key._value_type);
-			heap_iterator._heap.push(item);
+			heap.push_back(item);
 		}
-	}
-	{
-		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
 		for (std::shared_ptr<const SkipList> lists_ptr : _frozen_lists) {
 			for (SkipList::ConstIterator it = lists_ptr->begin();
 				 it != lists_ptr->end(); ++it) {
@@ -418,33 +439,37 @@ HeapIterator MemTable::begin(std::optional<std::uint64_t> commit_sequence_opt,
 				HeapIterator::HeapItem item(intr_key._key, it.value(),
 											intr_key._commit_sequence,
 											intr_key._value_type);
-				heap_iterator._heap.push(item);
+				heap.push_back(item);
 			}
 		}
 	}
-	// heap_iterator.clean_by_commit_sequence();
-	// // 如果value_type是tombstone, 那么弹掉这个key的所有sequence版本
-	// if (heap_iterator._skip_tombstone) { heap_iterator.clean_tombstone(); }
-	heap_iterator.clean_after_operate();
-	return heap_iterator;
-}
 
-HeapIterator &HeapIterator::clean_tombstone() {
-	// 如果value_type是tombstone, 那么弹掉这个key的所有sequence版本
-	while (!_heap.empty() && _heap.top()._value_type != Value) {
-		std::string last_tomb_key = _heap.top()._key;
-		while (!_heap.empty() && _heap.top()._key == last_tomb_key) {
-			_heap.pop();
-		}
-		clean_by_commit_sequence();
-	}
-	return *this;
+	return HeapIterator(std::move(heap), skip_tombstone, keep_all_version,
+						commit_sequence_opt);
 }
 
 // 在put完成之后进行清理, 依据commit_sequence以及skip_tomb_stone
 void HeapIterator::clean_after_operate() {
-	clean_by_commit_sequence();
-	if (_skip_tombstone) { clean_tombstone(); }
+	while (!_heap.empty() && (_heap.top()._commit_sequence > _commit_sequence ||
+							  (_skip_tombstone && _heap.top()._value_type ==
+													  ValueType::TombStone))) {
+		while (!_heap.empty() &&
+			   _heap.top()._commit_sequence > _commit_sequence) {
+			_heap.pop();
+		}
+		if (!_heap.empty() && _skip_tombstone) {
+			if (_heap.top()._value_type == ValueType::TombStone) {
+				std::string user_key = _heap.top()._key;
+				while (!_heap.empty() && _heap.top()._key == user_key) {
+					_heap.pop();
+				}
+			} else {
+				break;
+			}
+		} else {
+			break;
+		}
+	}
 }
 
 void HeapIterator::set_skip_tombstone(bool skip_tombstone) {
@@ -468,7 +493,10 @@ bool HeapIterator::operator!=(const BaseIterator &other) const {
 }
 
 std::pair<std::string, std::string> HeapIterator::operator*() const {
-	assert(!_heap.empty());
+	if (_heap.empty()) {
+		ERROR_LOG << "heap is empty";
+		throw std::runtime_error("heap is empty");
+	}
 	HeapItem heap_item = _heap.top();
 	std::string enc_key = InternalKey::encode(
 					InternalKey(heap_item._key, heap_item._commit_sequence,
@@ -499,6 +527,7 @@ HeapIterator MemTable::begin_preffix(const std::string &key,
 	HeapIterator heap_it(true, commit_sequence);
 	{
 		std::shared_lock<std::shared_mutex> active_shared(_active_mutex);
+		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
 		std::string begin_key =
 			InternalKey::encode(InternalKey(key, commit_sequence, Value));
 		SkipList::ConstIterator beg = _active_list->lower_bound(begin_key);
@@ -518,9 +547,6 @@ HeapIterator MemTable::begin_preffix(const std::string &key,
 										intr_key._value_type);
 			heap_it._heap.push(item);
 		}
-	}
-	{
-		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
 		for (std::shared_ptr<const SkipList> frozen_list : _frozen_lists) {
 			std::string enc_key =
 				InternalKey::encode(InternalKey(key, commit_sequence, Value));
@@ -544,8 +570,6 @@ HeapIterator MemTable::begin_preffix(const std::string &key,
 		}
 	}
 	heap_it.clean_after_operate();
-	// heap_it.clean_by_commit_sequence();
-	// if (heap_it._skip_tombstone) { heap_it.clean_tombstone(); }
 	return heap_it;
 }
 
@@ -568,6 +592,7 @@ HeapIterator MemTable::iter_monotony_predicate(
 	HeapIterator heap_it(skip_tombstone, commit_sequence, keep_all_version);
 	{
 		std::shared_lock<std::shared_mutex> active_shared(_active_mutex);
+		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
 		std::optional<
 			std::pair<SkipList::ConstIterator, SkipList::ConstIterator>>
 			res = _active_list->iter_monotony_predicate(wrapper_predicate);
@@ -580,9 +605,6 @@ HeapIterator MemTable::iter_monotony_predicate(
 					intr_key._value_type));
 			}
 		}
-	}
-	{
-		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
 		for (std::shared_ptr<const SkipList> frozen_list : _frozen_lists) {
 			std::optional<
 				std::pair<SkipList::ConstIterator, SkipList::ConstIterator>>
@@ -600,8 +622,6 @@ HeapIterator MemTable::iter_monotony_predicate(
 		}
 	}
 	heap_it.clean_after_operate();
-	// heap_it.clean_by_commit_sequence();
-	// if (heap_it._skip_tombstone) { heap_it.clean_tombstone(); }
 	return heap_it;
 }
 
@@ -609,13 +629,8 @@ MemTable::FlushLastResult
 MemTable::flush_last(SSTBuilder &builder, const std::string &sst_path,
 					 std::uint64_t sst_id,
 					 std::vector<std::uint64_t> &flushed_seqs) {
-	std::optional<std::uint64_t> flush_id = std::nullopt,
-								 new_active_id = std::nullopt;
-
-	std::shared_ptr<const SkipList> last_list;
-	int flag = 0;
-
-	{
+	{ // 先弹掉frozen_lists尾部的那些为空的skiplist,
+	  // 避免后面构建SST的时候构建出来一个空的SST
 		std::unique_lock<std::shared_mutex> frozen_unique(_frozen_mutex);
 		while (!_frozen_lists.empty() && _frozen_lists.front()->empty()) {
 			_frozen_lists.pop_front();
@@ -623,76 +638,49 @@ MemTable::flush_last(SSTBuilder &builder, const std::string &sst_path,
 		}
 	}
 
-	{
-		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
-		if (!_frozen_lists.empty()) {
-			flag = 1;
-			last_list = _frozen_lists.front();
-			// _frozen_lists.pop_front();
-			flush_id = _frozen_ids.front();
-			// _frozen_ids.pop_front();
-			// _frozen_bytes -= last_list->get_byte_size();
+	std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
+	std::unique_lock<std::shared_mutex> frozen_unqiue(_frozen_mutex);
+	if (!_frozen_lists.empty() && !_frozen_lists.front()->empty()) {
+		std::shared_ptr<const SkipList> list = _frozen_lists.front();
+		std::uint64_t flush_id = _frozen_ids.front();
+		for (auto it = list->begin(); it != list->end(); ++it) {
+			builder.add((*it).first, (*it).second);
+			flushed_seqs.push_back(
+				InternalKey::decode((*it).first)._commit_sequence);
 		}
-	}
-	// std::shared_ptr 重载了与 nullptr
-	// 的比较（operator==(std::nullptr_t)，C++11 起），last_list
-	// == nullptr 判断的就是"这个 shared_ptr 当前是否持有指针"
-	{
-		std::shared_lock<std::shared_mutex> active_shared(_active_mutex);
-		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
-		if (last_list == nullptr) {
-			if (!_frozen_lists.empty()) {
-				flag = 1;
-				last_list = _frozen_lists.front();
-				// _frozen_lists.pop_front();
-				flush_id = _frozen_ids.front();
-				// _frozen_ids.pop_front();
-				// _frozen_bytes -= last_list->get_byte_size();
-			} else {
-				if (!_active_list->empty()) {
-					flag = 2;
-					last_list = _active_list;
-					// _active_bytes = 0;
-					// _active_list = std::make_shared<SkipList>(_comparator);
-					flush_id = _active_id;
-					// _active_id++;
-					// new_active_id = _active_id;
-				}
-			}
-		}
-	}
-
-	if (last_list == nullptr) {
-		// 此时说明frozen和active中都没有数据, 返回空
-		return FlushLastResult(nullptr, std::nullopt, std::nullopt);
-	}
-
-	for (auto it = last_list->begin(); it != last_list->end(); ++it) {
-		std::string enc_key = (*it).first, value = (*it).second;
-		builder.add(InternalKey::decode(enc_key)._key, value,
-					InternalKey::decode(enc_key)._commit_sequence,
-					InternalKey::decode(enc_key)._value_type);
-		flushed_seqs.push_back(InternalKey::decode(enc_key)._commit_sequence);
-	}
-	std::shared_ptr<SST> sst = builder.build(sst_id, sst_path);
-	if (sst != nullptr) {
-		if (flag == 1) {
-			std::unique_lock<std::shared_mutex> frozen_unique(_frozen_mutex);
+		std::shared_ptr<SST> sst = builder.build(sst_id, sst_path);
+		if (sst != nullptr) {
+			_frozen_bytes -= list->get_byte_size();
 			_frozen_lists.pop_front();
 			_frozen_ids.pop_front();
-			_frozen_bytes -= last_list->get_byte_size();
-		} else if (flag == 2) {
-			std::unique_lock<std::shared_mutex> active_unique(_active_mutex);
-			if (_active_id == std::numeric_limits<std::uint64_t>::max()) {
-				throw std::runtime_error("run out of active_id");
-			}
-			_active_bytes = 0;
-			_active_list = std::make_shared<SkipList>(_comparator);
-			_active_id++;
-			new_active_id = _active_id;
 		}
+		return FlushLastResult(sst, flush_id, std::nullopt);
 	}
-	return FlushLastResult(sst, flush_id, new_active_id);
+
+	if (!_active_list->empty()) {
+		std::uint64_t flush_id = _active_id;
+		for (auto it = _active_list->begin(); it != _active_list->end(); ++it) {
+			builder.add((*it).first, (*it).second);
+			flushed_seqs.push_back(
+				InternalKey::decode((*it).first)._commit_sequence);
+		}
+		std::shared_ptr<SST> sst = builder.build(sst_id, sst_path);
+		if (sst != nullptr) {
+			if (_active_id == std::numeric_limits<std::uint64_t>::max()) {
+				ERROR_LOG << "new active id exceed max numeric limits";
+				throw std::runtime_error(
+					"new active id exceed max numeric limits");
+			} // 可能抛异常的代码一定要先做, 避免抛异常之后出现不一致问题
+			_active_list = std::make_shared<SkipList>(
+				_comparator); // 可能抛异常的代码一定要先做,
+							  // 避免抛异常之后出现不一致问题
+			_active_id++;
+			_active_bytes = 0;
+		}
+		return FlushLastResult(sst, flush_id, _active_id);
+	}
+
+	return FlushLastResult(nullptr, std::nullopt, std::nullopt);
 }
 
 std::size_t MemTable::get_total_size() {
