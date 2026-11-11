@@ -26,3 +26,5 @@ logs/
 .zcodeignore
 .idea/
 data/
+
+test/COVERAGE_AUDIT.md

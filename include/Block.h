@@ -51,7 +51,7 @@ public:
 	BlockIterator
 	begin(std::optional<std::uint64_t> commit_sequence = std::nullopt,
 		  bool keep_all_version = false);
-	BlockIterator end();
+	BlockIterator end(std::optional<std::uint64_t> commit_sequence = std::nullopt);
 
 	std::pair<BlockIterator, BlockIterator>
 	preffix(const std::string &user_key,

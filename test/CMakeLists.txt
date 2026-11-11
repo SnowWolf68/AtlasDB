@@ -37,7 +37,7 @@ set(
 
 # Deterministic server lifecycle tests use GNU ld syscall wrapping on Linux.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-	list(APPEND ATLASDB_NET_TEST_TARGETS tcpserver_test)
+	list(APPEND ATLASDB_NET_TEST_TARGETS tcpserver_test poller_channel_test)
 endif()
 
 list(APPEND ATLASDB_TEST_TARGETS ${ATLASDB_NET_TEST_TARGETS})
@@ -45,7 +45,8 @@ list(APPEND ATLASDB_TEST_TARGETS ${ATLASDB_NET_TEST_TARGETS})
 # Linux-only review/integration tests use GNU ld syscall wrapping and /proc
 # for scoped WAL fault injection. Other platforms skip these targets.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-	list(APPEND ATLASDB_TEST_TARGETS transaction_review_test atlasserver_test lsm_del_test file_read_test memtable_flush_regression_test memtable_begin_regression_test)
+	list(APPEND ATLASDB_TEST_TARGETS transaction_review_test atlasserver_test lsm_del_test file_read_test fileobj_test filesystem_test fileutil_test memtable_flush_regression_test memtable_begin_regression_test)
+	list(APPEND ATLASDB_TEST_TARGETS log_test storage_model_test)
 endif()
 
 foreach(test_target IN LISTS ATLASDB_TEST_TARGETS)
@@ -68,16 +69,32 @@ endforeach()
 # library code is unchanged. Other platforms still run the portable cases.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	target_compile_definitions(wal_test PRIVATE ATLASDB_WAL_FAULT_INJECTION=1)
-	target_link_options(wal_test PRIVATE "-Wl,--wrap=write" "-Wl,--wrap=fsync")
+	target_link_options(wal_test PRIVATE "-Wl,--wrap=pwrite" "-Wl,--wrap=fsync")
 	target_link_options(transaction_review_test PRIVATE "-Wl,--wrap=fsync")
 	set_tests_properties(transaction_review_test PROPERTIES TIMEOUT 60)
 	target_link_options(tcpserver_test PRIVATE
 		"-Wl,--wrap=bind" "-Wl,--wrap=accept4" "-Wl,--wrap=epoll_wait")
+	target_link_options(poller_channel_test PRIVATE
+		"-Wl,--wrap=epoll_create" "-Wl,--wrap=epoll_wait")
+	set_tests_properties(poller_channel_test PROPERTIES TIMEOUT 15)
 	set_tests_properties(tcpserver_test PROPERTIES TIMEOUT 120)
 	target_link_options(atlasserver_test PRIVATE
-		"-Wl,--wrap=bind" "-Wl,--wrap=accept4" "-Wl,--wrap=read" "-Wl,--wrap=write")
-	target_link_options(lsm_del_test PRIVATE "-Wl,--wrap=write")
+		"-Wl,--wrap=bind" "-Wl,--wrap=accept4" "-Wl,--wrap=read" "-Wl,--wrap=pwrite")
+	target_link_options(lsm_del_test PRIVATE "-Wl,--wrap=pwrite")
 	target_link_options(file_read_test PRIVATE "-Wl,--wrap=lseek" "-Wl,--wrap=pread")
+	target_link_options(fileobj_test PRIVATE
+		"-Wl,--wrap=pread" "-Wl,--wrap=pwrite" "-Wl,--wrap=fstat"
+		"-Wl,--wrap=ftruncate" "-Wl,--wrap=fsync" "-Wl,--wrap=close")
+	set_tests_properties(fileobj_test PROPERTIES TIMEOUT 60)
+	target_link_options(filesystem_test PRIVATE
+		"-Wl,--wrap=open" "-Wl,--wrap=unlink" "-Wl,--wrap=fsync" "-Wl,--wrap=close")
+	set_tests_properties(filesystem_test PROPERTIES TIMEOUT 60)
+	target_link_options(fileutil_test PRIVATE
+		"-Wl,--wrap=open" "-Wl,--wrap=pread" "-Wl,--wrap=pwrite"
+		"-Wl,--wrap=fstat" "-Wl,--wrap=fsync" "-Wl,--wrap=unlink" "-Wl,--wrap=close")
+	set_tests_properties(fileutil_test PROPERTIES TIMEOUT 60)
+	set_tests_properties(log_test PROPERTIES TIMEOUT 60)
+	set_tests_properties(storage_model_test PROPERTIES TIMEOUT 70)
 	target_link_options(memtable_flush_regression_test PRIVATE
 		"-Wl,--wrap=fsync"
 		"-Wl,--wrap=pthread_rwlock_rdlock" "-Wl,--wrap=pthread_rwlock_wrlock"

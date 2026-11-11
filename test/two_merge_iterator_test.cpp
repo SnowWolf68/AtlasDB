@@ -204,6 +204,31 @@ void test_tombstone_filtered_by_source() {
 	CHECK(!it.is_valid()); // 墓碑已被源流滤掉，归并层输出空
 }
 
+void test_invalid_dereference_throws_and_increment_is_noop() {
+	TwoMergeIterator iterator(make_mem_iter(false), make_mem_iter(false));
+	bool dereference_failed = false;
+	try { (void)*iterator; } catch (const std::runtime_error &) { dereference_failed = true; }
+	CHECK(dereference_failed);
+	CHECK(&++iterator == &iterator);
+	CHECK(!iterator.is_valid());
+}
+
+void test_end_comparison_and_different_iterator_types() {
+	auto source = make_mem_iter({{"a", "1", 1}, {"b", "2", 2}}, false);
+	TwoMergeIterator iterator(source, make_mem_iter(false));
+	TwoMergeIterator end(nullptr, nullptr);
+	CHECK(iterator != end);
+	CHECK(end != iterator);
+	CHECK(!(iterator == *source));
+	++iterator;
+	CHECK(iterator.is_valid() && iterator != end);
+	CHECK(InternalKey::decode((*iterator).first)._key == "b");
+	++iterator;
+	CHECK(iterator == end && end == iterator);
+	CHECK(&++end == &end);
+	CHECK(!end.is_valid());
+}
+
 // ─── 测试注册 ───────────────────────────────────────────────────
 
 struct TestCase {
@@ -224,6 +249,8 @@ int main() {
 		{"one side empty", test_one_side_empty},
 		{"end equality and empty", test_end_equality_and_empty},
 		{"tombstone filtered by source", test_tombstone_filtered_by_source},
+		{"invalid dereference throws and increment is no-op", test_invalid_dereference_throws_and_increment_is_noop},
+		{"end comparison and different iterator types", test_end_comparison_and_different_iterator_types},
 	};
 
 	std::size_t passed = 0;

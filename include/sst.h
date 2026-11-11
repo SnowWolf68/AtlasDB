@@ -2,7 +2,9 @@
 #include "Block.h"
 #include "BlockMeta.h"
 #include "Record.h"
+#include "io/FileObj.h"
 #include "util.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -37,7 +39,7 @@ private:
 
 class SST : public std::enable_shared_from_this<SST> {
 public:
-	SST(FileObj file, std::vector<BlockMeta> block_metas,
+	SST(atlas::io::FileObj file, std::vector<BlockMeta> block_metas,
 		std::uint32_t meta_section_offset, std::uint64_t sst_id,
 		const std::string &first_key, const std::string &last_key);
 
@@ -62,8 +64,9 @@ public:
 	std::shared_ptr<Comparator<std::string>> get_comparator() const;
 	// 删除磁盘上的SST文件
 	bool delete_file();
+
 private:
-	FileObj _file;
+	atlas::io::FileObj _file;
 	std::vector<BlockMeta> _block_metas;
 	std::uint32_t _meta_section_offset;
 	std::uint64_t _sst_id;
@@ -80,12 +83,12 @@ class SSTIterator {
 public:
 	SSTIterator &operator++();
 
-    // <enc_key, value>
+	// <enc_key, value>
 	std::pair<std::string, std::string> operator*() const;
 	bool operator==(const SSTIterator &other) const;
 	bool operator!=(const SSTIterator &other) const;
 	bool is_valid() const;
-    static SSTIterator invalid_iter();
+	static SSTIterator invalid_iter();
 
 
 private:
@@ -93,6 +96,8 @@ private:
 				BlockIterator block_iter);
 
 	void fresh_by_comseq();
+	void check_valid_or_switch_to_next_block(
+		std::optional<std::uint64_t> commit_sequence, bool keep_all_version);
 
 	std::shared_ptr<const SST> _sst;
 	std::size_t _block_idx;

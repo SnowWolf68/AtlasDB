@@ -267,6 +267,41 @@ void test_atomic_write_leaks_no_descriptor() {
 #endif
 }
 
+void test_legacy_cursor_read_and_zero_length_eof() {
+	const auto path = tmp_path("cursor_read_boundaries");
+	const std::vector<std::uint8_t> data = {'a', 0, 'b', 0xff, 'c'};
+	CHECK(FileObj::create_and_write(path, data).is_valid());
+	auto file = FileObj::open_read(path);
+	CHECK(file.read_continue(0).empty());
+	CHECK((file.read_continue(2) == std::vector<std::uint8_t>{'a', 0}));
+	CHECK((file.read_continue(20) == std::vector<std::uint8_t>{'b', 0xff, 'c'}));
+	CHECK(file.read_continue(1).empty());
+	CHECK(file.seek_begin());
+	CHECK(file.read_continue(data.size()) == data);
+	CHECK(file.close());
+	bool threw = false;
+	try { (void)file.read_continue(1); } catch (const std::runtime_error &) { threw = true; }
+	CHECK(threw);
+	rm_tmp(path);
+}
+
+void test_legacy_binary_write_uint64_and_clear() {
+	const auto path = tmp_path("legacy_write_and_clear");
+	CHECK(FileObj::create_and_write(path, {}).is_valid());
+	auto file = FileObj::open_rw(path);
+	const std::vector<std::uint8_t> bytes = {0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77};
+	CHECK(FileObj::get_bytes_of_uint64(0x0011223344556677ULL) == bytes);
+	CHECK(file.write_uint64(0x0011223344556677ULL) == bytes.size());
+	CHECK(file.read(0, bytes.size()) == bytes);
+	CHECK(file.clear()); CHECK(file.size() == 0);
+	CHECK(file.seek_begin()); // truncate does not promise to reset the cursor
+	CHECK(file.write_data({0, 0xff, 'x'}) == 3);
+	CHECK((file.read(0, 3) == std::vector<std::uint8_t>{0, 0xff, 'x'}));
+	CHECK(file.close());
+	CHECK(!file.clear());
+	rm_tmp(path);
+}
+
 // ─── test runner ────────────────────────────────────────────────
 
 struct TestCase {
@@ -294,6 +329,8 @@ int main() {
 		 test_atomic_write_publishes_and_replaces},
 		{"atomic write leaks no descriptor",
 		 test_atomic_write_leaks_no_descriptor},
+		{"legacy cursor reads handle zero length and EOF", test_legacy_cursor_read_and_zero_length_eof},
+		{"legacy binary writes and clear", test_legacy_binary_write_uint64_and_clear},
 	};
 
 	std::size_t passed = 0;

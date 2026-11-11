@@ -28,6 +28,7 @@ void test_quit_before_loop_drains_accepted_tasks() {
 	CHECK(loop.queue_in_loop([&] { ++calls; }));
 	loop.quit();
 	CHECK(!loop.queue_in_loop([&] { ++calls; }));
+	CHECK(!loop.run_or_queue_in_loop([&] { ++calls; }));
 	loop.loop();
 	CHECK(calls == 1);
 }
@@ -115,6 +116,63 @@ void test_readable_channel_dispatches_callback() {
 	CHECK(::close(fds[1]) == 0);
 }
 
+void test_multiple_producers_drain_once_and_preserve_per_producer_order() {
+	EventLoop loop;
+	const auto owner = std::this_thread::get_id();
+	std::vector<std::vector<int>> observed(4);
+	std::vector<std::thread> producers;
+	std::vector<std::exception_ptr> errors(4);
+	for (int producer = 0; producer < 4; ++producer) {
+		producers.emplace_back([&, producer] {
+			try {
+				for (int item = 0; item < 50; ++item) {
+					CHECK(loop.queue_in_loop([&, producer, item] {
+						CHECK(std::this_thread::get_id() == owner);
+						observed[producer].push_back(item);
+					}));
+				}
+			} catch (...) { errors[producer] = std::current_exception(); }
+		});
+	}
+	for (auto &producer : producers) { producer.join(); }
+	for (auto error : errors) { if (error) { std::rethrow_exception(error); } }
+	loop.quit();
+	loop.loop();
+	for (const auto &items : observed) {
+		CHECK(items.size() == 50);
+		for (int item = 0; item < 50; ++item) { CHECK(items[item] == item); }
+	}
+}
+
+void test_wrong_thread_management_is_rejected_without_disabling_owner() {
+	int fds[2] {-1, -1};
+	CHECK(::pipe2(fds, O_NONBLOCK | O_CLOEXEC) == 0);
+	EventLoop loop;
+	Channel channel(fds[0], Channel::TriggerMode::Level, &loop);
+	int rejected = 0;
+	std::thread worker([&] {
+		try { loop.loop(); } catch (const std::exception &) { ++rejected; }
+		try { loop.update_channel(&channel); } catch (const std::exception &) { ++rejected; }
+		try { loop.remove_channel(&channel); } catch (const std::exception &) { ++rejected; }
+	});
+	worker.join();
+	CHECK(rejected == 3);
+	int calls = 0;
+	channel.setReadCallback([&] {
+		char byte;
+		CHECK(::read(fds[0], &byte, 1) == 1 && byte == 'x');
+		++calls;
+		channel.disable_all();
+		channel.remove();
+		loop.quit();
+	});
+	channel.enable_reading();
+	CHECK(::write(fds[1], "x", 1) == 1);
+	loop.loop();
+	CHECK(calls == 1);
+	CHECK(::close(fds[0]) == 0 && ::close(fds[1]) == 0);
+}
+
 struct TestCase {
 	const char *name;
 	void (*run)();
@@ -132,6 +190,8 @@ int main() {
 		 test_cross_thread_tasks_and_quit_wake_loop},
 		{"readable channel dispatches callback",
 		 test_readable_channel_dispatches_callback},
+		{"multiple producers drain once in per-producer order", test_multiple_producers_drain_once_and_preserve_per_producer_order},
+		{"wrong-thread management leaves owner loop usable", test_wrong_thread_management_is_rejected_without_disabling_owner},
 	};
 
 	std::size_t passed = 0;

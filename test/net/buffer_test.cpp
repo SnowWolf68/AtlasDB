@@ -1,6 +1,7 @@
 #include "net/buffer.h"
 
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -89,6 +90,42 @@ void test_invalid_lengths_preserve_data() {
 	CHECK(buffer.peek() == "abc");
 }
 
+void test_mixed_operations_match_independent_byte_queue() {
+	Buffer buffer;
+	std::string expected;
+	std::mt19937 random(0x41544c41);
+	for (int step = 0; step < 1500; ++step) {
+		const unsigned operation = random() % 5;
+		if (operation < 2) {
+			std::vector<char> bytes(random() % 65);
+			for (auto &byte : bytes) { byte = static_cast<char>(random() & 0xff); }
+			if (operation == 0) { buffer.append(bytes); }
+			else { buffer.append(bytes.empty() ? "" : bytes.data(), static_cast<int>(bytes.size())); }
+			if (!bytes.empty()) { expected.append(bytes.data(), bytes.size()); }
+		} else if (operation == 2) {
+			const auto amount = random() % (expected.size() + 1);
+			auto actual = buffer.read(static_cast<int>(amount));
+			CHECK(actual.has_value());
+			CHECK(as_string(*actual) == expected.substr(0, amount));
+			expected.erase(0, amount);
+		} else if (operation == 3) {
+			const auto amount = random() % (expected.size() + 1);
+			CHECK(buffer.erase(static_cast<int>(amount)));
+			expected.erase(0, amount);
+		} else {
+			CHECK(!buffer.read(static_cast<int>(expected.size() + 1)));
+			CHECK(!buffer.erase(static_cast<int>(expected.size() + 1)));
+		}
+		CHECK(buffer.get_readable_size() == static_cast<int>(expected.size()));
+		CHECK(buffer.peek() == std::string_view(expected.data(), expected.size()));
+	}
+	auto remainder = buffer.read(static_cast<int>(expected.size()));
+	CHECK(remainder && as_string(*remainder) == expected);
+	CHECK(buffer.peek().empty());
+	buffer.append("again", 5);
+	CHECK(buffer.peek() == "again");
+}
+
 struct TestCase {
 	const char *name;
 	void (*run)();
@@ -105,6 +142,7 @@ int main() {
 		 test_append_grows_when_total_free_space_is_insufficient},
 		{"reuse after full consumption", test_reuse_after_full_consumption},
 		{"invalid lengths preserve data", test_invalid_lengths_preserve_data},
+		{"mixed operations match an independent byte queue", test_mixed_operations_match_independent_byte_queue},
 	};
 
 	std::size_t passed = 0;

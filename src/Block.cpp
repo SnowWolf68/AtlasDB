@@ -283,8 +283,8 @@ BlockIterator Block::begin(std::optional<std::uint64_t> commit_sequence,
 						 keep_all_version);
 }
 
-BlockIterator Block::end() {
-	return BlockIterator(shared_from_this(), _offsets.size(), std::nullopt,
+BlockIterator Block::end(std::optional<std::uint64_t> commit_sequence) {
+	return BlockIterator(shared_from_this(), _offsets.size(), commit_sequence,
 						 false);
 }
 

@@ -241,7 +241,7 @@ void wal_failure() {
 		CHECK(injected_errors == 1);
 		exchange(fd, command({"GET", "keep"}), bulk("old"));
 		expect_error(fd, command({"DEL", "keep"}));
-		expect_error(fd, command({"DEL", "missing"}));
+		exchange(fd, command({"DEL", "missing"}), ":0\r\n");
 	});
 }
 void concurrent_clients() {

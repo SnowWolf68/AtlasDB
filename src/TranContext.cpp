@@ -63,6 +63,10 @@ CommitResult TranContext::commit() {
 	if (_tran_state != TranState::Active) {
 		throw std::runtime_error("trancaction state is not active");
 	}
+	if (_map.empty()) {
+		_tran_state = TranState::Committed;
+		return CommitResult(CommitResult::Empty, std::nullopt);
+	}
 	CommitResult res = _engine->commit(_map, _iso_level, _snapshot_seq);
 	_map.clear();
 	_tran_state = res.status == CommitResult::Status::Committed

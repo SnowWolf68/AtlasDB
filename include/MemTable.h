@@ -33,12 +33,8 @@ public:
 		ValueType _value_type;
 	};
 
-	HeapIterator(bool skip_tombstone, bool keep_all_version = false);
-	HeapIterator(bool skip_tombstone,
-				 std::optional<std::uint64_t> commit_sequence,
-				 bool keep_all_version);
-	HeapIterator(bool skip_tombstone, std::uint64_t commit_sequence,
-				 bool keep_all_version = false);
+	HeapIterator(bool skip_tombstone, bool keep_all_version,
+				 std::optional<std::uint64_t> commit_sequence = std::nullopt);
 
 	HeapIterator(std::vector<HeapItem> heap, bool skip_tombstone,
 				 bool keep_all_version,

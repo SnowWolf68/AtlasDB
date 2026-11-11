@@ -7,11 +7,15 @@ using Result = LSMEngine::DelResult;
 void semantics() {
 	LSM db("./data");
 	CHECK(db.del("absent") == Result::NotFound);
-	CHECK(db.put("key", "old").has_value());
+	const auto first_seq = db.put("key", "old");
+	CHECK(first_seq.has_value());
+	CHECK(*first_seq == 1); // A missing DEL does not consume a sequence number.
 	CHECK(db.del("key") == Result::Success);
 	CHECK(!db.get("key").is_found());
 	CHECK(db.del("key") == Result::NotFound);
-	CHECK(db.put("key", "new").has_value());
+	const auto next_seq = db.put("key", "new");
+	CHECK(next_seq.has_value());
+	CHECK(*next_seq == *first_seq + 2); // Only the successful DEL consumes a sequence.
 	CHECK(db.get("key")._value == "new");
 	CHECK(db.del("key") == Result::Success);
 	CHECK(db.put("", "").has_value());
@@ -25,7 +29,7 @@ void closed_and_wal_error() {
 		CHECK(db.put("key", "value").has_value());
 		db.close();
 		CHECK(db.del("key") == Result::Error);
-		CHECK(db.del("missing") == Result::Error);
+		CHECK(db.del("missing") == Result::NotFound);
 	}
 	LSM db("./data");
 	CHECK(db.put("key", "value").has_value());
@@ -33,7 +37,7 @@ void closed_and_wal_error() {
 	CHECK(db.del("key") == Result::Error);
 	CHECK(injected_errors == 1);
 	CHECK(db.get("key")._value == "value");
-	CHECK(db.del("missing") == Result::Error);
+	CHECK(db.del("missing") == Result::NotFound);
 	CHECK(db.del("key") == Result::Error);
 }
 void concurrent_deletes() {
@@ -106,7 +110,9 @@ void flush_and_reopen() {
 		CHECK(sst_count() > before);
 		const auto after = sst_count();
 		CHECK(db.del("missing") == Result::NotFound);
-		CHECK(sst_count() > after); // Current contract permits a tombstone for a miss.
+		CHECK(sst_count() == after); // A missing DEL must not write another tombstone.
+		CHECK(db.del("deleted") == Result::NotFound);
+		CHECK(sst_count() == after); // An existing tombstone also needs no new write.
 	}
 	LSM db("./data");
 	CHECK(!db.get("deleted").is_found());

@@ -288,21 +288,79 @@ void test_commit_state_transitions() {
 	CHECK(throws_runtime_error([&] { tx->abort(); }));
 }
 
-void test_empty_transaction_consumes_one_seq() {
+void test_empty_transaction_ends_without_consuming_seq() {
 	TempDir dir;
 	{
 		auto engine = std::make_shared<LSMEngine>(dir.path);
-		auto tx = engine->begin_transaction(IsolationLevel::ReadCommited);
-		auto res = tx->commit();
-		CHECK(res.status == CommitResult::Status::Committed);
-		CHECK(res.commit_seq && *res.commit_seq == 1);
-		CHECK(engine->put("k", "v") == 2);
+		for (auto level : {IsolationLevel::ReadCommited,
+						   IsolationLevel::ReadRepeated}) {
+			auto tx = engine->begin_transaction(level);
+			auto res = tx->commit();
+			CHECK(res.status == CommitResult::Status::Empty);
+			CHECK(!res.commit_seq.has_value());
+			// Empty commits end the context just like commits with writes.
+			CHECK(!tx->put("k", "again"));
+			CHECK(throws_runtime_error([&] { tx->get("k"); }));
+			CHECK(throws_runtime_error([&] { tx->remove("k"); }));
+			CHECK(throws_runtime_error([&] { tx->commit(); }));
+			CHECK(throws_runtime_error([&] { tx->abort(); }));
+		}
+		CHECK(engine->put("k", "v") == 1);
 		engine->close();
 	}
-	// a count=0 WAL record must parse on recovery without damage
+	// Empty commits consume no sequence, including across a normal reopen.
 	LSMEngine db(dir.path);
 	CHECK(db.get("k")._value == "v");
-	CHECK(db.put("k2", "v") == 3);
+	CHECK(db.put("k2", "v") == 2);
+}
+
+void test_empty_transactions_do_not_consume_seq_across_process_exit() {
+	TempDir dir;
+	tx_without_close(dir.path, [&](std::shared_ptr<LSMEngine> &engine) {
+		CHECK(engine->put("base", "value") == 1);
+		for (auto level : {IsolationLevel::ReadCommited,
+						   IsolationLevel::ReadRepeated}) {
+			auto tx = engine->begin_transaction(level);
+			// Read-only transactions also have an empty write set.
+			CHECK(tx->get("base") == std::optional<std::string>("value"));
+			auto committed = tx->commit();
+			CHECK(committed.status == CommitResult::Status::Empty);
+			CHECK(!committed.commit_seq.has_value());
+		}
+	});
+	LSMEngine reopened(dir.path);
+	CHECK(reopened.get("base")._value == "value");
+	CHECK(reopened.get("base")._commit_sequence == 1);
+	const auto next = reopened.put("next", "value");
+	CHECK(next && *next == 2);
+}
+
+void test_transaction_length_boundaries_preserve_write_set() {
+	TempDir dir;
+	const std::string maximum_key(65527, 'k');
+	const std::string maximum_value(65535, 'v');
+	{
+		auto engine = std::make_shared<LSMEngine>(dir.path);
+		auto tx = engine->begin_transaction(IsolationLevel::ReadCommited);
+		CHECK(tx->put("retained", "valid"));
+		CHECK(!tx->put("retained", maximum_value + "x"));
+		CHECK(tx->get("retained") == "valid");
+		CHECK(!tx->put(maximum_key + "x", "invalid"));
+		CHECK(!tx->remove(maximum_key + "x"));
+		CHECK(tx->put(maximum_key, "maximum-key"));
+		CHECK(tx->put("", maximum_value));
+		const auto committed = tx->commit();
+		CHECK(committed.status == CommitResult::Status::Committed);
+		CHECK(engine->get("retained")._value == "valid");
+		CHECK(engine->get(maximum_key)._value == "maximum-key");
+		CHECK(engine->get("")._value == maximum_value);
+		CHECK(engine->get(maximum_key + "x")._value_type == NotFound);
+		engine->close();
+	}
+	LSMEngine reopened(dir.path);
+	CHECK(reopened.get("retained")._value == "valid");
+	CHECK(reopened.get(maximum_key)._value == "maximum-key");
+	CHECK(reopened.get("")._value == maximum_value);
 }
 
 void test_whole_transaction_survives_process_exit() {
@@ -528,8 +586,12 @@ int main() {
 		{"abort discards and state machine",
 		 test_abort_discards_and_state_machine},
 		{"commit state transitions", test_commit_state_transitions},
-		{"empty transaction consumes one seq",
-		 test_empty_transaction_consumes_one_seq},
+		{"empty transaction ends without consuming seq",
+		 test_empty_transaction_ends_without_consuming_seq},
+		{"empty transactions do not consume seq across process exit",
+		 test_empty_transactions_do_not_consume_seq_across_process_exit},
+		{"transaction length boundaries preserve prior write set",
+		 test_transaction_length_boundaries_preserve_write_set},
 		{"whole transaction survives process exit",
 		 test_whole_transaction_survives_process_exit},
 		{"torn multi-op transaction all or nothing",

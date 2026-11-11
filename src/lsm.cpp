@@ -5,9 +5,13 @@
 #include "MemTable.h"
 #include "Record.h"
 #include "TranContext.h"
+#include "codec.h"
+#include "io/FileSystem.h"
+#include "io/FileUtil.h"
 #include "log.h"
 #include "sst.h"
 #include "util.h"
+
 #include <algorithm>
 #include <bits/types/FILE.h>
 #include <cerrno>
@@ -55,7 +59,12 @@ LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 	// manifest相关
 	std::string manifest_filepath = _data_dir + "/" + DEFAULT_MANIFEST_FILENAME;
 	if (!std::filesystem::exists(manifest_filepath)) {
-		FileObj manifest_file = FileObj::create_rw(manifest_filepath);
+		atlas::io::OpenOptions options;
+		options._create_mode = atlas::io::CreateMode::CreateNew;
+		options._access_mode = atlas::io::AccessMode::WriteOnly;
+		options._truncate = true;
+		atlas::io::FileObj manifest_file =
+			atlas::io::FileSystem::open(manifest_filepath, options);
 		// 把磁盘上的sst文件恢复到manifest中
 		std::stringstream ss;
 		for (auto item : std::filesystem::directory_iterator(_data_dir)) {
@@ -72,12 +81,21 @@ LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 				ss << sst_info->first << "," << sst_info->second << "\n";
 			}
 		}
-		FileObj::atomic_write(manifest_filepath, ss.str());
+		std::string write_str = ss.str();
+		std::vector<std::uint8_t> write_data(write_str.begin(),
+											 write_str.end());
+		atlas::io::atomic_write_all_replace(manifest_file, write_data);
 	}
 
 	// 读manifest, 找到所有需要恢复的<sst_id, level>集合
 	if (sst_infos.empty()) {
-		FileObj manifest_file(manifest_filepath);
+		// FileObj manifest_file(manifest_filepath);
+		atlas::io::OpenOptions options;
+		options._access_mode = atlas::io::AccessMode::ReadOnly;
+		options._create_mode = atlas::io::CreateMode::OpenExisting;
+		options._truncate = false;
+		atlas::io::FileObj manifest_file =
+			atlas::io::FileSystem::open(manifest_filepath, options);
 		std::fstream fs(manifest_filepath);
 		std::string line;
 		std::getline(fs, line);
@@ -146,15 +164,39 @@ LSMEngine::LSMEngine(const std::string &data_dir, std::size_t max_memtable_size,
 	std::uint64_t wal_max_commit_sequence = _wal.load_wal(_data_dir, _memtable);
 	_com_seq_filepath = _data_dir + "/" + DEFAULT_COM_SEQ_FILENAME;
 	if (std::filesystem::exists(_com_seq_filepath)) {
-		FileObj seq_file = FileObj::open_read(_com_seq_filepath);
-		std::uint64_t commit_sequence = seq_file.read_uint64(0);
+		atlas::io::OpenOptions options;
+		options._access_mode = atlas::io::AccessMode::ReadOnly;
+		options._create_mode = atlas::io::CreateMode::OpenExisting;
+		options._truncate = false;
+		atlas::io::FileObj seq_file =
+			atlas::io::FileSystem::open(_com_seq_filepath, options);
+		// std::uint64_t commit_sequence = seq_file.read_uint64(0);
+		std::vector<std::uint8_t> buffer(8);
+		std::size_t read_size = seq_file.read_at(0, buffer);
+		if (read_size != 8) {
+			ERROR_LOG << "seq file read error";
+			throw std::runtime_error("seq file read error");
+		}
+		std::optional<std::size_t> commit_sequence_opt =
+			codec::read_u64_be(buffer, 0);
+		if (commit_sequence_opt == std::nullopt) {
+			ERROR_LOG << "seq file read error";
+			throw std::runtime_error("seq file read error");
+		}
+		std::uint64_t commit_sequence = commit_sequence_opt.value();
 		commit_sequence = std::max(commit_sequence, wal_max_commit_sequence);
 		_commit_sequence.store(commit_sequence);
 	} else {
-		std::uint64_t init_seq = 0;
-		std::vector<std::uint8_t> data = get_bytes_of_uint64t(init_seq);
-		FileObj::atomic_write(_com_seq_filepath, data);
-		_commit_sequence.store(std::max(0UL, wal_max_commit_sequence));
+		atlas::io::OpenOptions options;
+		options._access_mode = atlas::io::AccessMode::WriteOnly;
+		options._create_mode = atlas::io::CreateMode::CreateNew;
+		options._truncate = true;
+		atlas::io::FileObj com_seq_file =
+			atlas::io::FileSystem::open(_com_seq_filepath, options);
+		std::vector<std::uint8_t> data;
+		codec::append_u64_be(data, wal_max_commit_sequence);
+		atlas::io::atomic_write_all_replace(com_seq_file, data);
+		_commit_sequence.store(wal_max_commit_sequence);
 	}
 }
 
@@ -163,17 +205,6 @@ bool LSMEngine::is_all_digit(const std::string &str) {
 		if (!(ch >= '0' && ch <= '9')) { return false; }
 	}
 	return true;
-}
-
-std::vector<std::uint8_t>
-LSMEngine::encode_sst_info(std::pair<std::size_t, std::size_t> sst_info) {
-	std::vector<std::uint8_t> id_bytes = get_bytes_of_uint64t(sst_info.first);
-	std::vector<std::uint8_t> data(id_bytes);
-	std::vector<std::uint8_t> level_bytes =
-		get_bytes_of_uint64t(sst_info.second);
-	data.push_back(',');
-	data.insert(data.end(), level_bytes.begin(), level_bytes.end());
-	return data;
 }
 
 std::string LSMEngine::get_sst_path(std::size_t id, std::size_t level) {
@@ -211,7 +242,12 @@ void LSMEngine::renew_manifest(const std::string &manifest_path) {
 			data.insert(data.end(), str.begin(), str.end());
 		}
 	}
-	FileObj::atomic_write(manifest_path, data);
+	atlas::io::OpenOptions options;
+	options._access_mode = atlas::io::AccessMode::ReadWrite;
+	options._create_mode = atlas::io::CreateMode::OpenExisting;
+	atlas::io::FileObj manifest_file =
+		atlas::io::FileSystem::open(manifest_path, options);
+	atlas::io::atomic_write_all_replace(manifest_file, data);
 }
 
 /**
@@ -227,11 +263,6 @@ std::uint64_t LSMEngine::flush() {
 	std::lock_guard<std::mutex> wal_write_mutex(_wal_write_mutex);
 	std::unique_lock<std::shared_mutex> unique(_ssts_mutex);
 
-	std::vector<std::uint8_t> data =
-		get_bytes_of_uint64t(_commit_sequence.load());
-	// FileObj::create_and_write(_com_seq_filepath, data);
-	FileObj::atomic_write(_com_seq_filepath, data);
-
 	cur_sst_id = _next_sst_id;
 	_next_sst_id++;
 	MemTable::FlushLastResult flush_res = _memtable.flush_last(
@@ -244,6 +275,11 @@ std::uint64_t LSMEngine::flush() {
 	// 直接整体覆盖manifest文件
 	std::string manifest_filepath = _data_dir + "/" + DEFAULT_MANIFEST_FILENAME;
 	renew_manifest(manifest_filepath);
+
+	// 在删除wal之前保存一下commit_sequence到seq.txt
+	std::vector<std::uint8_t> data;
+	codec::append_u64_be(data, _commit_sequence.load());
+	atlas::io::atomic_write_all_replace(_com_seq_filepath, data);
 
 	// 删除对应的wal文件
 	try {
@@ -283,12 +319,13 @@ std::uint64_t LSMEngine::flush() {
 */
 std::optional<std::uint64_t> LSMEngine::put(const std::string &key,
 											const std::string &value) {
-	// return apply_insert(key, value, commit_sequence, ValueType::Value);
 	if (value.size() > Block::MAX_VALUE_LEN - 1) { return std::nullopt; }
 	std::optional<std::uint64_t> res = std::nullopt;
 	{
 		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
 		std::shared_lock<std::shared_mutex> shared(_close_mutex);
+		// 只能写入完成之后再推进sequence, 因为如果先+commit_sequence的话,
+		// 如果当前数据还没写入, 那么就会让读者提前看到当前并没有写入的数据
 		std::uint64_t commit_sequence = _commit_sequence.load() + 1;
 		res = apply_insert(key, value, commit_sequence, ValueType::Value);
 		_commit_sequence.fetch_add(1);
@@ -328,9 +365,6 @@ LSMEngine::apply_insert(const std::string &key, const std::string &value,
 		}
 
 		if (frozen_list_id != std::nullopt) {
-			// 发生了froze
-			_wal.fsync();
-			_wal.close();
 			try {
 				_wal = WAL(_data_dir, new_active_id.value());
 			} catch (const std::exception &e) { _wal_error = true; }
@@ -367,16 +401,15 @@ LSMEngine::DelResult LSMEngine::del(const std::string &key) {
 		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
 		std::shared_lock<std::shared_mutex> shared(_close_mutex);
 		get_res = get(key);
+		if (get_res._value_type != ValueType::Value) {
+			return DelResult::NotFound;
+		}
 		std::uint64_t commit_sequence = _commit_sequence.load() + 1;
 		res = apply_insert(key, "", commit_sequence, ValueType::TombStone);
 		_commit_sequence.fetch_add(1);
 	}
 	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
 	if (res == std::nullopt) { return DelResult::Error; }
-	if ((get_res._value_type == NotFound || get_res._value_type == TombStone) &&
-		res != std::nullopt) {
-		return DelResult::NotFound;
-	}
 	return DelResult::Success;
 }
 
@@ -420,19 +453,16 @@ LSMEngine::put_batch(std::vector<std::pair<std::string, std::string>> kvs) {
 */
 std::vector<std::optional<std::uint64_t>>
 LSMEngine::remove_batch(std::vector<std::string> ks) {
-	std::vector<std::optional<std::uint64_t>> res =
-		std::vector<std::optional<std::uint64_t>>(ks.size(), std::nullopt);
+	std::vector<std::optional<std::uint64_t>> res(ks.size(), std::nullopt);
 	{
-		{
-			std::lock_guard<std::mutex> lguard(_wal_write_mutex);
-			std::shared_lock<std::shared_mutex> shared(_close_mutex);
-			for (std::size_t i = 0; i < ks.size(); i++) {
-				std::uint64_t commit_sequence = _commit_sequence.load() + 1;
-				res[i] = apply_insert(ks[i], "", commit_sequence,
-									  ValueType::TombStone);
-				_commit_sequence.fetch_add(1);
-				if (res[i] == std::nullopt) { break; }
-			}
+		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
+		std::shared_lock<std::shared_mutex> shared(_close_mutex);
+		for (std::size_t i = 0; i < ks.size(); i++) {
+			std::uint64_t commit_sequence = _commit_sequence.load() + 1;
+			res[i] =
+				apply_insert(ks[i], "", commit_sequence, ValueType::TombStone);
+			_commit_sequence.fetch_add(1);
+			if (res[i] == std::nullopt) { break; }
 		}
 	}
 	if (_memtable.get_total_size() >= _max_memtable_size) { flush(); }
@@ -519,8 +549,6 @@ LSMEngine::get_from_sst_without_lock(const std::string &user_key,
 				InternalKey decode = InternalKey::decode(enc_key);
 				return LookUpResult(value, decode._commit_sequence,
 									decode._value_type);
-			} else {
-				continue;
 			}
 		}
 	}
@@ -549,6 +577,7 @@ LSMEngine::get_batch(const std::vector<std::string> &keys,
 LookUpResult LSMEngine::get(const std::string &key) {
 	return get(key, _commit_sequence.load());
 }
+
 std::vector<LookUpResult>
 LSMEngine::get_batch(const std::vector<std::string> &keys) {
 	std::vector<std::uint64_t> seqs(keys.size(), _commit_sequence.load());
@@ -580,7 +609,6 @@ ConcatIterator::ConcatIterator(std::vector<std::shared_ptr<SST>> ssts,
 ConcatIterator LSMEngine::level_begin_without_lock(
 	std::size_t level_idx, std::optional<std::uint64_t> commit_sequence,
 	bool keep_all_version) {
-	// std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
 	if (_sst_id_map.find(level_idx) == _sst_id_map.end()) {
 		return ConcatIterator(std::vector<std::shared_ptr<SST>>(), 0,
 							  std::nullopt, false);
@@ -604,22 +632,29 @@ ConcatIterator LSMEngine::level_end(std::size_t level_idx) {
 HeapIterator LSMEngine::level_0_begin_without_lock(
 	std::optional<std::uint64_t> commit_sequence, bool keep_all_version,
 	bool skip_tombstone) {
-	HeapIterator heap_it(skip_tombstone, commit_sequence, keep_all_version);
-	// std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
+	std::vector<HeapIterator::HeapItem> heap;
 	if (_sst_id_map.find(0) != _sst_id_map.end()) {
 		for (std::size_t l0_id : _sst_id_map[0]) {
 			std::shared_ptr<SST> cur_sst = _ssts[l0_id];
 			for (SSTIterator it = cur_sst->begin(std::nullopt, true);
 				 it != cur_sst->end(); ++it) {
-				heap_it.put((*it).first, (*it).second);
+				std::string enc_key = (*it).first, value = (*it).second;
+				std::string user_key = InternalKey::decode(enc_key)._key;
+				std::uint64_t seq =
+					InternalKey::decode(enc_key)._commit_sequence;
+				ValueType value_type = InternalKey::decode(enc_key)._value_type;
+				heap.push_back(
+					HeapIterator::HeapItem(user_key, value, seq, value_type));
 			}
 		}
 	}
-	heap_it.clean_after_operate();
+	HeapIterator heap_it(heap, skip_tombstone, keep_all_version,
+						 commit_sequence);
 	return heap_it;
 }
+
 HeapIterator LSMEngine::level_0_end() {
-	// 这里其实些什么都行, 因为==比的是heap是否为空, 其余都不参与比较
+	// 这里其实写什么都行, 因为==比的是heap是否为空, 其余都不参与比较
 	return HeapIterator(false, true);
 }
 
@@ -635,7 +670,8 @@ HeapIterator LSMEngine::iter_monotony_predicate(
 		predicate,
 		commit_sequence == std::nullopt ? MAX_COMMIT_SEQUENCE
 										: commit_sequence.value(),
-		false, true);
+		false, true); // 前面在收集的时候必须要能够看到所有版本,
+					  // 这样才能让下面SST的遍历能够把之前的tombstone抑制住
 	std::shared_lock<std::shared_mutex> shared(_ssts_mutex);
 	for (std::size_t level = 0; level <= _cur_max_level; level++) {
 		if (_sst_id_map.find(level) == _sst_id_map.end()) { continue; }
@@ -680,6 +716,8 @@ HeapIterator LSMEngine::iter_monotony_predicate(
 			}
 		}
 	}
+	// 后面这里是要给用户返回查询结果的迭代器, 因此只能看到最新版本,
+	// 并且跳过删除的元素
 	heap_it.set_keep_all_version(false);
 	heap_it.set_skip_tombstone(true);
 	heap_it.clean_after_operate();
@@ -702,19 +740,7 @@ CommitResult LSMEngine::commit(
 	std::unordered_map<std::string, std::optional<std::string>> map,
 	IsolationLevel level, std::uint64_t snapshot_seq) {
 	std::optional<std::uint64_t> commit_sequence = std::nullopt;
-	{ // 不同的commit之间需要互斥, 因此需要加锁
-		// 并且当前的commit也要和其他的单独的写互斥,
-		// 也就是和单独的put/remove也要互斥
-		// 因此可以考虑也使用wal_write_mutex这把锁,
-		// 因为这里commit的时候也需要先写wal, 然后再put到memtable中
-
-		// 并且这里由于事务的原子性, 因此wal的记录也需要以事务为单位,
-		// 这样恢复的时候如果发现某一个事务里的操作不完整, 就放弃恢复,
-		// 这样就能保证不会出现一个事务恢复了一半的情况出现
-
-		// 在这里先加锁然后再取号sequence
-		// 写wal的时候也要把sequence传递过去, 因为这里的map中的key是user_key,
-		// 没有commit_sequence
+	{
 		std::lock_guard<std::mutex> lguard(_wal_write_mutex);
 		std::shared_lock<std::shared_mutex> close_shared(_close_mutex);
 		if (_wal_error) {
@@ -766,9 +792,6 @@ CommitResult LSMEngine::commit(
 		std::optional<std::uint64_t> new_active_id =
 			froze_result._new_active_list_id;
 		if (frozen_list_id != std::nullopt) {
-			// 发生了froze
-			_wal.fsync();
-			_wal.close();
 			try {
 				_wal = WAL(_data_dir, new_active_id.value());
 			} catch (const std::exception &e) { _wal_error = true; }
@@ -786,37 +809,9 @@ CommitResult LSMEngine::commit(
 
 std::shared_ptr<TranContext>
 LSMEngine::begin_transaction(IsolationLevel level) {
-	// 这里的snapshot_sequence应该是_commit_sequence.load() - 1
-	// 因为这里snapshot的意思就是说当前数据库里最新的版本是多少,
-	// load()之后是下一个要分配的号, 当前最新的号就是load() - 1
-
-	// 除此之外, 这里也需要对wal_write_mutex加锁
-	// 因为这里snapshot = x的含义就是说当前所有序号小于等于x的事务都已经做完了
-	// 那么如果此时不对wal加锁,
-	// 那么有可能还有另外一个事务正在commit中还没执行完,
-	// 但是另外的这个事务已经取号了 那么这样的话就会导致本来应该看到的数据
-	// (另外一个已经取号的事务) 在当前这个事务下看不到
-	// 后续如果另外的这个事务提交了, 那么这个数据在当前事务下就能看到了
-	// 从一开始看不到, 到后来能看到, 如果当前是在RR的隔离级别,
-	// 那显然就违反了RR的规则 因此这里需要对wal_write_mutex加锁
-
-	// 但是之类不需要加close锁, 也不需要判断close,
-	// 因为事务最后提交的commit的时候会进行判断
-
-	// 不止这里需要先加锁再取号, 其他put的地方也需要先加锁再put
-	// 因为如果其他地方先取号再加锁, 那么可能取完号,
-	// 没加锁之前其他的事务加锁获取了当前最新的序号, 并开始了事务
-	// 那么这个事务一开始就看不到这个put的结果, 后面如果这个put加锁成功写入完成,
-	// 后面这个事务就又能看到这个数据了
-	// 因此其他的put写入以及其他的类似接口也都需要先加锁再取号,
-	// 并且需要一直持有锁直到数据写入
-
-	std::lock_guard<std::mutex> lguard(_wal_write_mutex);
 	std::uint64_t snapshot_seq = _commit_sequence.load();
-
 	std::shared_ptr<TranContext> ptr(
 		new TranContext(shared_from_this(), snapshot_seq, level));
-
 	return ptr;
 }
 
@@ -838,8 +833,7 @@ LSMEngine::generate_sst_from_bast_iter(BaseIterator &base_iter,
 		std::string user_key = InternalKey::decode((*base_iter).first)._key;
 		if (!builder.empty() && is_full && user_key != prev_user_key) {
 			is_full = false;
-			std::size_t sst_id = 0;
-			sst_id = _next_sst_id;
+			std::size_t sst_id = _next_sst_id;
 			_next_sst_id++;
 			std::shared_ptr<SST> sst =
 				builder.build(sst_id, get_sst_path(sst_id, target_level));
@@ -855,8 +849,7 @@ LSMEngine::generate_sst_from_bast_iter(BaseIterator &base_iter,
 		++base_iter;
 	}
 	if (!builder.empty()) {
-		std::size_t sst_id = 0;
-		sst_id = _next_sst_id;
+		std::size_t sst_id = _next_sst_id;
 		_next_sst_id++;
 		std::shared_ptr<SST> sst =
 			builder.build(sst_id, get_sst_path(sst_id, target_level));
@@ -868,26 +861,10 @@ LSMEngine::generate_sst_from_bast_iter(BaseIterator &base_iter,
 std::vector<std::shared_ptr<SST>>
 LSMEngine::compact_l0_l1(std::size_t max_sst_size) {
 	// 所有数据都要搬运进新表, tombstone也是数据, 并且保留所有version
-	std::shared_ptr<HeapIterator> l0_iter =
-		std::make_shared<HeapIterator>(false, true);
-	std::shared_ptr<ConcatIterator> l1_iter = nullptr;
-	if (_sst_id_map.find(0) != _sst_id_map.end()) {
-		for (std::size_t l0_id : _sst_id_map[0]) {
-			std::shared_ptr<SST> cur_sst = _ssts[l0_id];
-			for (SSTIterator it = cur_sst->begin(std::nullopt, true);
-				 it != cur_sst->end(); ++it) {
-				l0_iter->put((*it).first, (*it).second);
-			}
-		}
-	}
-	if (_sst_id_map.find(1) != _sst_id_map.end()) {
-		std::vector<std::shared_ptr<SST>> l1_ssts;
-		for (std::size_t l1_id : _sst_id_map[1]) {
-			l1_ssts.push_back(_ssts[l1_id]);
-		}
-		l1_iter =
-			std::make_shared<ConcatIterator>(l1_ssts, 0, std::nullopt, true);
-	}
+	std::shared_ptr<HeapIterator> l0_iter = std::make_shared<HeapIterator>(
+		level_0_begin_without_lock(std::nullopt, true, false));
+	std::shared_ptr<ConcatIterator> l1_iter = std::make_shared<ConcatIterator>(
+		level_begin_without_lock(1, std::nullopt, true));
 	TwoMergeIterator merge_iter(l0_iter, l1_iter, true);
 	return generate_sst_from_bast_iter(merge_iter, max_sst_size, 1);
 }
@@ -1032,7 +1009,7 @@ void LSMEngine::renew_manifest_without_delete_with_insert(
 			}
 		}
 	}
-	FileObj::atomic_write(manifest_filepath, data);
+	atlas::io::atomic_write_all_replace(manifest_filepath, data);
 }
 
 std::size_t LSMEngine::get_level_sst_size(std::size_t level) {
@@ -1101,11 +1078,6 @@ bool ConcatIterator::operator!=(const BaseIterator &other) const {
 }
 bool ConcatIterator::is_valid() const {
 	return _cur_sst_idx < _ssts.size() && _sst_iter.is_valid();
-}
-
-ConcatIterator ConcatIterator::invalid() {
-	return ConcatIterator(std::vector<std::shared_ptr<SST>>(), 0, std::nullopt,
-						  true);
 }
 
 TwoMergeIterator::TwoMergeIterator(std::shared_ptr<BaseIterator> first_iter,
@@ -1229,8 +1201,8 @@ LSMEngineIterator::LSMEngineIterator(
 	  _commit_sequence(commit_sequence), _keep_all_version(keep_all_version),
 	  _skip_tombstone(skip_tombstone),
 	  _comparator(std::make_shared<InternalKeyComparator>()) {
-	_iters.push_back(std::make_shared<HeapIterator>(std::move(
-		_engine->memtable_begin(_commit_sequence, keep_all_version, false))));
+	_iters.push_back(std::make_shared<HeapIterator>(
+		_engine->memtable_begin(_commit_sequence, keep_all_version, false)));
 	for (std::size_t level = 0; level <= _engine->get_cur_max_level();
 		 level++) {
 		if (_engine->_sst_id_map.find(level) == _engine->_sst_id_map.end()) {
@@ -1242,9 +1214,11 @@ LSMEngineIterator::LSMEngineIterator(
 			_iters.push_back(
 				std::make_shared<HeapIterator>(std::move(heap_it)));
 		} else {
-			_iters.push_back(std::make_shared<ConcatIterator>(
-				std::move(_engine->level_begin_without_lock(
-					level, _commit_sequence, _keep_all_version))));
+			_iters.push_back(
+				std::make_shared<ConcatIterator>( // 本身返回的临时对象就是右值,
+												  // 不需要move
+					_engine->level_begin_without_lock(level, _commit_sequence,
+													  _keep_all_version)));
 		}
 	}
 	// memtable层的HeapIterator以及level0的HeapIterator,
@@ -1254,98 +1228,7 @@ LSMEngineIterator::LSMEngineIterator(
 	// 而最终呈现出来的需要跳过tombstone, 因此需要在operator++中进行跳过
 
 	// 比较选出第一个遍历的位置
-	choose_and_skip();
-}
-
-bool LSMEngineIterator::is_tombstone(std::shared_ptr<BaseIterator> cur_it) {
-	if (cur_it == nullptr || !cur_it->is_valid()) { return false; }
-	std::string enc_key = (*(*cur_it)).first;
-	return InternalKey::decode(enc_key)._value_type == TombStone;
-}
-
-void LSMEngineIterator::skip_user_key(
-	const std::string &user_key, std::optional<std::size_t> white_list_idx) {
-	for (std::size_t i = 0; i < _iters.size(); i++) {
-		if (white_list_idx != std::nullopt && white_list_idx.value() == i) {
-			continue;
-		}
-		if (_iters[i] != nullptr && _iters[i]->is_valid()) {
-			while (_iters[i]->is_valid() &&
-				   InternalKey::decode((*(*_iters[i])).first)._key ==
-					   user_key) {
-				++(*_iters[i]);
-			}
-		}
-	}
-}
-
-bool LSMEngineIterator::skip_other_version() {
-	if (_keep_all_version) {
-		return true; // 不需要过滤
-	}
-	if (_cur_iter_idx >= _iters.size() || !_iters[_cur_iter_idx]->is_valid()) {
-		return false;
-	}
-	// 跳过user_key相同的其他所有版本
-	std::string user_key =
-		InternalKey::decode((*(*_iters[_cur_iter_idx])).first)._key;
-	skip_user_key(user_key, _cur_iter_idx);
-	return true;
-}
-
-/**
-memtable: c@5, d@9, k@10(活值), y@2
-L1:       a@10, k@20(墓碑), z@1
-L2: 	  e@5, f@9, g@2, k@15(活值), y@2
-
-可以发现, 由于排序规则是按照user_key升序, commit_sequence降序
-那么, 对于一个同时处于多个source的user_key(比如这里的user_key = k)
-当choose选择到user_key = k时, 首先选择的一定是commit_sequence最大的一个,
-并且此时另外几个iter也一定走到了k的位置
-(反证, 如果没走到, 那么对应的user_key一定比k小, 那么下一个就会走这个iter)
-因此此时只需要看当前user_key = k对应的是不是tombstone,
-如果是, 那么让其余几个iter把这个user_key跳过即可
-
-	-- 这个函数单独用来choose, choose_and_skip负责skip_tombstone
-	-- return : 全都是无效的时候返回false
-*/
-bool LSMEngineIterator::choose() {
-	// 找到第一个有效的位置放置当前的_cur_iter_idx,
-	// 避免后续和cur_idx比较的时候cur无效
-	for (std::size_t i = 0; i < _iters.size(); i++) {
-		if (_iters[i] != nullptr && _iters[i]->is_valid()) {
-			_cur_iter_idx = i;
-		}
-	}
-	if (_cur_iter_idx >= _iters.size() || !_iters[_cur_iter_idx]->is_valid()) {
-		return false;
-	}
-	for (std::size_t i = 0; i < _iters.size(); i++) {
-		if (!_iters[i]->is_valid()) { continue; }
-		std::string min_enc_key = (*(*_iters[_cur_iter_idx])).first,
-					enc_key = (*(*_iters[i])).first;
-		if (_iters[i] != nullptr && _iters[i]->is_valid() &&
-			(*_comparator)(enc_key, min_enc_key) < 0) {
-			_cur_iter_idx = i;
-		}
-	}
-	if (!_keep_all_version) skip_other_version();
-	return true;
-}
-
-bool LSMEngineIterator::choose_and_skip() {
-	bool res = false;
-	res = choose();
-	while (_skip_tombstone && _cur_iter_idx < _iters.size() &&
-		   _iters[_cur_iter_idx]->is_valid() &&
-		   is_tombstone(_iters[_cur_iter_idx])) {
-		skip_user_key(
-			InternalKey::decode((*(*_iters[_cur_iter_idx])).first)._key,
-			std::nullopt);
-		// 重新choose
-		res = choose();
-	}
-	return res;
+	filter_by_param();
 }
 
 // <enc_key, value>
@@ -1353,12 +1236,88 @@ std::pair<std::string, std::string> LSMEngineIterator::operator*() const {
 	if (!is_valid()) { throw std::runtime_error("iter is not valid."); }
 	return *(*(_iters[_cur_iter_idx]));
 }
+
 BaseIterator &LSMEngineIterator::operator++() {
 	if (!is_valid()) { return *this; }
-	++(*_iters[_cur_iter_idx]);
-	choose_and_skip();
+	next();
 	return *this;
 }
+
+void LSMEngineIterator::filter_by_param() {
+	while (true) {
+		clean_by_commit_sequence();
+		compare_choose_next();
+		if (_skip_tombstone && _iters[_cur_iter_idx]->is_valid() &&
+			InternalKey::decode((**_iters[_cur_iter_idx]).first)._value_type ==
+				TombStone) {
+			std::string user_key =
+				InternalKey::decode((**_iters[_cur_iter_idx]).first)._key;
+			skip_all_version_user_key(user_key);
+		} else {
+			break;
+		}
+	}
+}
+
+void LSMEngineIterator::next() {
+	if (_keep_all_version) {
+		++*(_iters[_cur_iter_idx]);
+	} else {
+		std::string user_key =
+			InternalKey::decode((*(*_iters[_cur_iter_idx])).first)._key;
+		skip_all_version_user_key(user_key);
+	}
+	filter_by_param();
+}
+
+void LSMEngineIterator::skip_all_version_user_key(const std::string &user_key) {
+	for (auto &ptr : _iters) {
+		if (ptr == nullptr) {
+			ERROR_LOG << "iters ptr is nullptr";
+			throw std::runtime_error("iters ptr is nullptr");
+		}
+		while (ptr->is_valid() &&
+			   InternalKey::decode((**ptr).first)._key == user_key) {
+			++*ptr;
+		}
+	}
+}
+
+void LSMEngineIterator::compare_choose_next() {
+	bool flag = true;
+	std::string min_enc_key;
+	for (std::size_t i = 0; i < _iters.size(); i++) {
+		auto &ptr = _iters[i];
+		if (ptr == nullptr) {
+			ERROR_LOG << "iters ptr is nullptr";
+			throw std::runtime_error("iters ptr is nullptr");
+		}
+		if (ptr->is_valid() &&
+			(flag || (*_comparator)((**ptr).first, min_enc_key) < 0)) {
+			_cur_iter_idx = i;
+			min_enc_key = (**ptr).first;
+			flag = false;
+		}
+	}
+}
+
+void LSMEngineIterator::clean_by_commit_sequence() {
+	for (auto &ptr : _iters) {
+		if (ptr == nullptr) {
+			ERROR_LOG << "iters ptr is nullptr";
+			throw std::runtime_error("iters ptr is nullptr");
+		}
+		std::uint64_t commit_sequence = _commit_sequence == std::nullopt
+											? MAX_COMMIT_SEQUENCE
+											: _commit_sequence.value();
+		while (ptr->is_valid() &&
+			   InternalKey::decode((**ptr).first)._commit_sequence >
+				   commit_sequence) {
+			++*ptr;
+		}
+	}
+}
+
 bool LSMEngineIterator::operator==(const BaseIterator &other) const {
 	const LSMEngineIterator *other_ptr =
 		dynamic_cast<const LSMEngineIterator *>(&other);

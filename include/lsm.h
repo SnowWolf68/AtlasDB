@@ -26,7 +26,7 @@ class TranContext;
 
 class CommitResult {
 public:
-	enum Status { Committed, Conflict, Closed };
+	enum Status { Empty, Committed, Conflict, Closed };
 
 	CommitResult(Status status, std::optional<std::uint64_t> seq);
 
@@ -96,11 +96,13 @@ public:
 	LookUpResult get(const std::string &key);
 	std::vector<LookUpResult> get_batch(const std::vector<std::string> &keys);
 
-	ConcatIterator level_begin_without_lock(std::size_t level_idx,
-							   std::optional<std::uint64_t> commit_sequence,
-							   bool keep_all_version);
+	ConcatIterator
+	level_begin_without_lock(std::size_t level_idx,
+							 std::optional<std::uint64_t> commit_sequence,
+							 bool keep_all_version);
 	ConcatIterator level_end(std::size_t level_idx);
-	HeapIterator level_0_begin_without_lock(std::optional<std::uint64_t> commit_sequence,
+	HeapIterator
+	level_0_begin_without_lock(std::optional<std::uint64_t> commit_sequence,
 							   bool keep_all_version, bool skip_tombstone);
 	HeapIterator level_0_end();
 	std::vector<std::shared_ptr<SST>>
@@ -157,8 +159,6 @@ private:
 											  std::uint64_t commit_sequence,
 											  ValueType value_type);
 	void renew_manifest(const std::string &manifest_path);
-	static std::vector<std::uint8_t>
-	encode_sst_info(std::pair<std::size_t, std::size_t> sst_info);
 
 	void renew_manifest_without_delete_with_insert(std::size_t level1,
 												   std::size_t level2,
@@ -200,7 +200,6 @@ public:
 	bool operator==(const BaseIterator &other) const override;
 	bool operator!=(const BaseIterator &other) const override;
 	bool is_valid() const override;
-	static ConcatIterator invalid();
 
 private:
 	std::vector<std::shared_ptr<SST>> _ssts;
@@ -249,12 +248,11 @@ public:
 	bool is_valid() const;
 
 private:
-	bool choose();
-	bool is_tombstone(std::shared_ptr<BaseIterator> cur_it);
-	void skip_user_key(const std::string &user_key,
-					   std::optional<std::size_t> white_list_idx);
-	bool choose_and_skip();
-	bool skip_other_version();
+	void next();
+	void skip_all_version_user_key(const std::string& user_key);
+	void compare_choose_next();
+	void clean_by_commit_sequence();
+	void filter_by_param();
 
 	std::shared_ptr<LSMEngine> _engine;
 	std::vector<std::shared_ptr<BaseIterator>> _iters;

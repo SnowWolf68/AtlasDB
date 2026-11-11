@@ -32,24 +32,13 @@ public:
 	std::uint64_t load_wal(const std::string &dir, MemTable &memtable);
 	bool append(const std::string &enc_key, const std::string &value);
 	bool append(std::vector<std::uint8_t> data);
-	bool clear();
 	bool fsync();
 	bool delete_();
-	bool close();
+	void close();
 	static std::string get_filepath(const std::string &dir, std::uint64_t id);
 
 private:
-	FileObj _file;
+	atlas::io::FileObj _file;
 
 	bool check_id_str(const std::string &id_str);
-	static std::vector<std::uint8_t> append_u8(std::vector<std::uint8_t> &data,
-											   std::uint8_t u8);
-	static std::vector<std::uint8_t> append_u16(std::vector<std::uint8_t> &data,
-												std::uint16_t u16);
-	static std::vector<std::uint8_t> append_u32(std::vector<std::uint8_t> &data,
-												std::uint32_t u32);
-	static std::vector<std::uint8_t> append_u64(std::vector<std::uint8_t> &data,
-												std::uint8_t u64);
-	static std::vector<std::uint8_t> append_str(std::vector<std::uint8_t> &data,
-												const std::string &str);
 };

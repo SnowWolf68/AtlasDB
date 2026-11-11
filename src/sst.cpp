@@ -1,8 +1,12 @@
 #include "sst.h"
 #include "BlockMeta.h"
 #include "Record.h"
+#include "codec.h"
+#include "io/FileSystem.h"
+#include "io/FileUtil.h"
 #include "log.h"
 #include "util.h"
+
 #include <cassert>
 #include <cerrno>
 #include <cstring>
@@ -67,18 +71,20 @@ std::shared_ptr<SST> SSTBuilder::build(std::uint64_t sst_id,
 	std::uint32_t meta_section_offset = write_data.size();
 	write_data.insert(write_data.end(), meta_section_data.begin(),
 					  meta_section_data.end());
-	std::vector<std::uint8_t> meta_offset_bytes =
-		get_bytes_of_uint32t(meta_section_offset);
-	write_data.insert(write_data.end(), meta_offset_bytes.begin(),
-					  meta_offset_bytes.end());
+	codec::append_u32_be(write_data, meta_section_offset);
 	write_data.push_back(MAGIC_NUM); // write_data构造完成
 
-	FileObj::atomic_write(path, write_data);
-	FileObj file = FileObj::open_rw(path);
-	if (!file.is_valid()) {
-		throw std::runtime_error("file " + path +
-								 " open failed, errno: " + strerror(errno));
-	}
+	atlas::io::OpenOptions open_options;
+	open_options._access_mode = atlas::io::AccessMode::ReadWrite;
+	open_options._create_mode = atlas::io::CreateMode::OpenOrCreate;
+	open_options._truncate = true;
+	atlas::io::FileObj file = atlas::io::FileSystem::open(path, open_options);
+	atlas::io::atomic_write_all_replace(file, write_data);
+	open_options._access_mode = atlas::io::AccessMode::ReadOnly;
+	open_options._create_mode = atlas::io::CreateMode::OpenExisting;
+	open_options._truncate = false;
+	file = atlas::io::FileSystem::open(
+		path, open_options); // rename之后文件fd换了, 需要重新打开绑定
 	std::string first_key = _block_metas[0]._first_key;
 	std::string last_key = _block_metas[_block_metas.size() - 1]._last_key;
 	return std::make_shared<SST>(std::move(file), _block_metas,
@@ -92,7 +98,7 @@ std::size_t SSTBuilder::get_estimated_size() {
 
 bool SSTBuilder::empty() { return get_estimated_size() == 0; }
 
-SST::SST(FileObj file, std::vector<BlockMeta> block_metas,
+SST::SST(atlas::io::FileObj file, std::vector<BlockMeta> block_metas,
 		 std::uint32_t meta_section_offset, std::uint64_t sst_id,
 		 const std::string &first_key, const std::string &last_key)
 	: _file(std::move(file)), _block_metas(block_metas),
@@ -100,28 +106,60 @@ SST::SST(FileObj file, std::vector<BlockMeta> block_metas,
 	  _first_key(first_key), _last_key(last_key),
 	  _comparator(std::make_shared<InternalKeyComparator>()) {}
 
+/**
+Block数据 + Meta Section + Meta Offset (4B) + Magic number (1B)
+*/
 std::shared_ptr<SST> SST::open(const std::string &path, std::uint64_t sst_id) {
 	try { // read相关逻辑可能抛异常, 这里捕获一下, 如果有异常直接返回nullptr
-		FileObj file = FileObj::open_read(path);
-		if (!file.is_valid()) {
-			LOG(Log::ERROR) << "file: " << path << " open read failed!";
-			return nullptr;
-		}
+		atlas::io::OpenOptions open_options;
+		open_options._create_mode = atlas::io::CreateMode::OpenExisting;
+		open_options._access_mode = atlas::io::AccessMode::ReadOnly;
+		open_options._truncate = false;
+		atlas::io::FileObj file =
+			atlas::io::FileSystem::open(path, open_options);
 		std::size_t file_size = file.size();
 		if (file_size < 5) {
 			LOG(Log::ERROR) << "SST file: " << path << " not valid";
 			return nullptr;
 		}
-		std::uint8_t magic_num = file.read_uint8(file_size - 1);
+		std::vector<std::uint8_t> data(1);
+		std::size_t read_size = file.read_at(file_size - 1, data);
+		if (read_size != 1) {
+			ERROR_LOG << "magic num read failed";
+			return nullptr;
+		}
+		std::optional<std::uint8_t> magic_num_opt = codec::read_u8(data, 0);
+		if (magic_num_opt == std::nullopt) {
+			ERROR_LOG << "magic num read failed";
+			return nullptr;
+		}
+		std::uint8_t magic_num = magic_num_opt.value();
 		if (magic_num != SSTBuilder::MAGIC_NUM) {
 			LOG(Log::ERROR)
 				<< "magic num error, magic num: " << std::to_string(magic_num);
 			return nullptr;
 		}
-		std::uint32_t meta_section_offset = file.read_uint32(file_size - 5);
+		data.resize(4);
+		read_size = file.read_at(file_size - 5, data);
+		if (read_size != data.size()) {
+			ERROR_LOG << "meta section offset data missing";
+			return nullptr;
+		}
+		std::optional<std::uint32_t> meta_section_offset_opt =
+			codec::read_u32_be(data, 0);
+		if (meta_section_offset_opt == std::nullopt) {
+			ERROR_LOG << "meta section offset decode failed";
+			return nullptr;
+		}
+		std::uint32_t meta_section_offset = meta_section_offset_opt.value();
 		if (meta_section_offset > file_size - 5) { return nullptr; }
-		std::vector<std::uint8_t> block_meta_data =
-			file.read(meta_section_offset, file_size - meta_section_offset - 5);
+		std::vector<std::uint8_t> block_meta_data(file_size -
+												  meta_section_offset - 5);
+		read_size = file.read_at(meta_section_offset, block_meta_data);
+		if (read_size != block_meta_data.size()) {
+			ERROR_LOG << "block meta data missing";
+			return nullptr;
+		}
 		std::optional<std::vector<BlockMeta>> block_meta_optional =
 			BlockMeta::decode(block_meta_data);
 		if (block_meta_optional == std::nullopt) { return nullptr; }
@@ -157,8 +195,14 @@ std::shared_ptr<Block> SST::read_block(std::size_t block_idx) const {
 			block_end_offset > _meta_section_offset) {
 			return nullptr;
 		}
-		std::vector<std::uint8_t> block_data = _file.read(
-			block_start_offset, block_end_offset - block_start_offset);
+
+		std::vector<std::uint8_t> block_data(block_end_offset -
+											 block_start_offset);
+		std::size_t read_size = _file.read_at(block_start_offset, block_data);
+		if (read_size != block_data.size()) {
+			ERROR_LOG << "block data missing";
+			return nullptr;
+		}
 		return Block::decode(block_data, true);
 	} catch (const std::exception &e) {
 		LOG(Log::ERROR) << e.what();
@@ -230,21 +274,8 @@ SSTIterator SST::end() const {
 	return SSTIterator(shared_from_this(), num_blocks(), last_block->end());
 }
 
-void SSTIterator::fresh_by_comseq() {
-	std::optional<std::uint64_t> commit_sequence =
-		_block_iter.get_commit_sequence();
-	bool keep_all_version = _block_iter.get_keep_all_version();
-
-	// 注意: 此时this (SSTIterator) 可能是 无效 状态
-	if (!is_valid()) {
-		if (_block_idx >= _sst->num_blocks()) {
-			return;
-		} else {
-			++*this;
-		}
-	}
-	_block_iter
-		.clean_by_commit_sequence(); // 这个东西清完有可能搞出来无效的iter
+void SSTIterator::check_valid_or_switch_to_next_block(
+	std::optional<std::uint64_t> commit_sequence, bool keep_all_version) {
 	while (!_block_iter.is_valid()) {
 		// 下一个block
 		if (_block_idx >= _sst->num_blocks()) {
@@ -264,6 +295,28 @@ void SSTIterator::fresh_by_comseq() {
 		}
 		_block_iter = block->begin(commit_sequence, keep_all_version);
 	}
+}
+
+/**
+ * BlockIterator里的clean_by_commit_sequence只能清理某一个Block里的, 不能跨Block
+ * 因此这里需要用这个东西实现跨Block的清理
+ */
+void SSTIterator::fresh_by_comseq() {
+	std::optional<std::uint64_t> commit_sequence =
+		_block_iter.get_commit_sequence();
+	bool keep_all_version = _block_iter.get_keep_all_version();
+
+	// 注意: 此时this (SSTIterator) 可能是 无效 状态
+	if (!is_valid()) {
+		if (_block_idx >= _sst->num_blocks()) {
+			return;
+		} else {
+			++*this;
+		}
+	}
+	_block_iter
+		.clean_by_commit_sequence(); // 这个东西清完有可能搞出来无效的iter
+	check_valid_or_switch_to_next_block(commit_sequence, keep_all_version);
 }
 
 std::optional<std::pair<SSTIterator, SSTIterator>>
@@ -296,7 +349,8 @@ SST::iter_monotony_predicate(std::function<int(const std::string &)> predicate,
 
 	// 默认情况下, 如果当前l块不符合要求, 那么返回end(),
 	// 后续往后找第一个符合要求的
-	SSTIterator sst_begin_iter(shared_from_this(), l, blk->end());
+	SSTIterator sst_begin_iter(shared_from_this(), l,
+							   blk->end(commit_sequence));
 
 	std::optional<std::pair<BlockIterator, BlockIterator>>
 		begin_block_predicate_res =
@@ -346,35 +400,7 @@ SST::iter_monotony_predicate(std::function<int(const std::string &)> predicate,
 		if (!sst_end_iter.is_valid()) { ++sst_end_iter; }
 	}
 
-	// todo
-	// 找到第一个 predicate > 0 并且commit_sequence <
-	// 传入的commit_sequence的iter, 作为end
-
-	// 所谓的归一化, 就是让iter往后走到符合要求的commit_sequence位置,
-	// 否则从begin++的iter比较不到end位置
-	sst_end_iter._block_iter.clean_by_commit_sequence();
-	// 如果清完之后iter失效了, 那么就走到下一个block
-	// 如果当前的iter就是end, 那么直接构造返回
-	if (sst_end_iter._block_idx == sst_end_iter._sst->num_blocks()) {
-		return std::make_pair(sst_begin_iter, sst_end_iter);
-	}
-
-	bool keep_all_version = sst_end_iter._block_iter.get_keep_all_version();
-
-	while (!sst_end_iter.is_valid()) {
-		sst_end_iter._block_idx++;
-		if (sst_end_iter._block_idx == sst_end_iter._sst->num_blocks()) break;
-		std::shared_ptr<Block> block = sst_end_iter._sst->read_block(
-			sst_end_iter._block_idx); // 如果遇到坏块, 这里可能为空
-		if (block == nullptr) {
-			sst_end_iter._block_iter = BlockIterator::invalid_iter();
-			continue;
-		}
-		sst_end_iter._block_iter =
-			block->begin(commit_sequence, keep_all_version);
-		sst_end_iter._block_iter.clean_by_commit_sequence();
-	}
-
+	sst_end_iter.fresh_by_comseq();
 
 	if (sst_begin_iter == sst_end_iter) { return std::nullopt; }
 	return std::make_pair(sst_begin_iter, sst_end_iter);
@@ -384,7 +410,10 @@ std::shared_ptr<Comparator<std::string>> SST::get_comparator() const {
 	return _comparator;
 }
 
-bool SST::delete_file() { return _file.delete_(); }
+bool SST::delete_file() {
+	std::string file_path = _file.get_file_path();
+	return atlas::io::FileSystem::remove_file(file_path);
+}
 
 SSTIterator::SSTIterator(std::shared_ptr<const SST> sst, std::size_t block_idx,
 						 BlockIterator block_iter)
@@ -400,26 +429,9 @@ SSTIterator &SSTIterator::operator++() {
 		++_block_iter;
 		if (_block_iter.is_valid()) { return *this; }
 	}
-	while (!_block_iter.is_valid()) {
-		// Block切换
-		if (_block_idx >= _sst->num_blocks()) {
-			// 本来就是end()了, 不能再往后跳了
-			return *this;
-		}
-		_block_idx++;
-		if (_block_idx >= _sst->num_blocks()) {
-			// 后面没有block了
-			return *this;
-		}
-		// 后面还有block, 切换block
-		std::shared_ptr<Block> block =
-			_sst->read_block(_block_idx); // 如果遇到坏块也有可能为空
-		if (block == nullptr) {
-			_block_iter = BlockIterator::invalid_iter();
-			continue;
-		}
-		_block_iter = block->begin(commit_sequence, keep_all_version);
-	}
+	// fresh_by_comseq();		// 这里不能直接调用这个东西,
+	// 因为fresh_by_comseq里面也会调用operator++, 这样会造成无限递归
+	check_valid_or_switch_to_next_block(commit_sequence, keep_all_version);
 	return *this;
 }
 std::pair<std::string, std::string> SSTIterator::operator*() const {

@@ -15,6 +15,7 @@
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <utility>
 
 #ifdef __linux__
 #include <dirent.h>
@@ -202,6 +203,8 @@ void test_end_to_end_connect_accept_and_half_close() {
 	InetAddress conn_local = conn.local_address();
 	CHECK(conn_local._ip == "127.0.0.1");
 	CHECK(conn_local._port == listen_port);
+	const auto actual_peer = conn.peer_address();
+	CHECK(actual_peer._ip == "127.0.0.1" && actual_peer._port == client_port);
 
 	// 数据往返
 	CHECK(::write(client_fd, "ping", 5) == 5);
@@ -274,6 +277,40 @@ void test_rebind_same_port_after_connection_cycle() {
 
 // ─── test runner ────────────────────────────────────────────────
 
+void test_move_assignment_preserves_each_socket_and_closes_once() {
+	int first_fd = -1, second_fd = -1;
+	{
+		Socket first = Socket::createTcp(AF_INET), second = Socket::createTcp(AF_INET);
+		first.bind_address(InetAddress(0)); second.bind_address(InetAddress(0));
+		const auto first_port = first.local_address()._port;
+		const auto second_port = second.local_address()._port;
+		first_fd = first.fd(); second_fd = second.fd();
+		CHECK(first_port != second_port);
+		CHECK(&(second = std::move(first)) == &second);
+		CHECK(second.fd() == first_fd && second.local_address()._port == first_port);
+		CHECK(first.fd() == second_fd && first.local_address()._port == second_port);
+		Socket &self = second;
+		second = std::move(self);
+		CHECK(second.fd() == first_fd && second.local_address()._port == first_port);
+	}
+	CHECK(::fcntl(first_fd, F_GETFD) == -1 && errno == EBADF);
+	CHECK(::fcntl(second_fd, F_GETFD) == -1 && errno == EBADF);
+}
+
+void test_invalid_socket_operations_report_errors() {
+	Socket invalid(-1);
+	InetAddress peer(0);
+	int rejected = 0;
+	try { invalid.bind_address(InetAddress(0)); } catch (const std::runtime_error &) { ++rejected; }
+	try { invalid.listen(1); } catch (const std::runtime_error &) { ++rejected; }
+	try { invalid.accept(&peer); } catch (const std::runtime_error &) { ++rejected; }
+	try { (void)invalid.local_address(); } catch (const std::runtime_error &) { ++rejected; }
+	try { (void)invalid.peer_address(); } catch (const std::runtime_error &) { ++rejected; }
+	try { invalid.set_reuse_addr(true); } catch (const std::runtime_error &) { ++rejected; }
+	CHECK(rejected == 6);
+	invalid.shutdown_write(); // shutdown failure is currently logged, with no exception
+}
+
 struct TestCase {
 	const char *name;
 	void (*run)();
@@ -299,6 +336,8 @@ int main() {
 		 test_accept_multiple_connections_until_empty},
 		{"rebind same port after connection cycle",
 		 test_rebind_same_port_after_connection_cycle},
+		{"move assignment preserves socket resources", test_move_assignment_preserves_each_socket_and_closes_once},
+		{"invalid socket operations report errors", test_invalid_socket_operations_report_errors},
 	};
 
 	std::size_t passed = 0;

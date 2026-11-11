@@ -321,24 +321,12 @@ HeapIterator::HeapItem::HeapItem(const std::string &key,
 	: _key(key), _value(value), _commit_sequence(commit_sequence),
 	  _value_type(value_type) {}
 
-
-HeapIterator::HeapIterator(bool skip_tombstone, bool keep_all_version)
-	: _skip_tombstone(skip_tombstone), _commit_sequence(MAX_COMMIT_SEQUENCE),
-	  _keep_all_version(keep_all_version) {}
-
-HeapIterator::HeapIterator(bool skip_tombstone,
-						   std::optional<std::uint64_t> commit_sequence,
-						   bool keep_all_version)
-	: _skip_tombstone(skip_tombstone), _commit_sequence(MAX_COMMIT_SEQUENCE),
-	  _keep_all_version(keep_all_version) {
-	if (commit_sequence != std::nullopt) {
-		_commit_sequence = commit_sequence.value();
-	}
-}
-
-HeapIterator::HeapIterator(bool skip_tombstone, std::uint64_t commit_sequence,
-						   bool keep_all_version)
-	: _skip_tombstone(skip_tombstone), _commit_sequence(commit_sequence),
+HeapIterator::HeapIterator(bool skip_tombstone, bool keep_all_version,
+						   std::optional<std::uint64_t> commit_sequence)
+	: _skip_tombstone(skip_tombstone),
+	  _commit_sequence(commit_sequence == std::nullopt
+						   ? MAX_COMMIT_SEQUENCE
+						   : commit_sequence.value()),
 	  _keep_all_version(keep_all_version) {}
 
 HeapIterator::HeapIterator(std::vector<HeapItem> heap, bool skip_tombstone,
@@ -479,7 +467,8 @@ void HeapIterator::set_keep_all_version(bool keep_all_version) {
 	_keep_all_version = keep_all_version;
 }
 
-HeapIterator MemTable::end() const { return HeapIterator(true); }
+HeapIterator MemTable::end() const { return HeapIterator(false, true); }
+
 bool HeapIterator::operator==(const BaseIterator &other) const {
 	return !((*this) != other);
 }
@@ -524,7 +513,7 @@ std::string MemTable::get_next_str(const std::string &str) {
 
 HeapIterator MemTable::begin_preffix(const std::string &key,
 									 std::uint64_t commit_sequence) const {
-	HeapIterator heap_it(true, commit_sequence);
+	HeapIterator heap_it(true, false, commit_sequence);
 	{
 		std::shared_lock<std::shared_mutex> active_shared(_active_mutex);
 		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);
@@ -589,7 +578,7 @@ HeapIterator MemTable::iter_monotony_predicate(
 		InternalKey intr_key = InternalKey::decode(enc_key);
 		return predicate(intr_key._key);
 	};
-	HeapIterator heap_it(skip_tombstone, commit_sequence, keep_all_version);
+	HeapIterator heap_it(skip_tombstone, keep_all_version, commit_sequence);
 	{
 		std::shared_lock<std::shared_mutex> active_shared(_active_mutex);
 		std::shared_lock<std::shared_mutex> frozen_shared(_frozen_mutex);

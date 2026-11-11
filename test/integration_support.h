@@ -12,6 +12,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -75,8 +76,8 @@ inline int run(const std::vector<Case> &cases, int argc, char **argv) {
 
 // Only WAL files in this case's temporary data directory can fail. In
 // particular, eventfd wakeups, stdout and unrelated tests are unaffected.
-extern "C" ssize_t __real_write(int, const void *, size_t);
-extern "C" ssize_t __wrap_write(int fd, const void *data, size_t size) {
+extern "C" ssize_t __real_pwrite(int, const void *, size_t, off_t);
+extern "C" ssize_t __wrap_pwrite(int fd, const void *data, size_t size, off_t offset) {
 	if (integration::fail_wal_write.load()) {
 		char target[4096];
 		const auto link = "/proc/self/fd/" + std::to_string(fd);
@@ -88,5 +89,5 @@ extern "C" ssize_t __wrap_write(int fd, const void *data, size_t size) {
 			return -1;
 		}
 	}
-	return __real_write(fd, data, size);
+	return __real_pwrite(fd, data, size, offset);
 }

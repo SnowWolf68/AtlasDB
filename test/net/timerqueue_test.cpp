@@ -7,6 +7,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -156,6 +157,98 @@ void test_shutdown_discards_future_timer() {
 	CHECK(calls == 0);
 }
 
+void test_invalid_intervals_and_post_quit_requests_are_rejected() {
+	EventLoop loop;
+	int calls = 0;
+	const auto callback = [&] { ++calls; };
+	CHECK(!loop.add_task_repeat_after_delay(std::chrono::milliseconds(0),
+		std::chrono::milliseconds(0), callback));
+	CHECK(!loop.add_task_repeat_after_delay(std::chrono::milliseconds(0),
+		std::chrono::milliseconds(-1), callback));
+	loop.quit();
+	CHECK(!loop.add_task_after_delay(std::chrono::milliseconds(1), callback));
+	CHECK(!loop.add_task_at(std::chrono::steady_clock::now(), callback));
+	CHECK(!loop.add_task_repeat_after_delay(std::chrono::milliseconds(1),
+		std::chrono::milliseconds(1), callback));
+	CHECK(!loop.cancel(1));
+	loop.loop();
+	CHECK(calls == 0);
+}
+
+void test_past_deadline_and_negative_delay_run_without_waiting_for_watchdog() {
+	EventLoop loop;
+	std::vector<int> calls;
+	CHECK(loop.add_task_at(std::chrono::steady_clock::now() - std::chrono::hours(1), [&] {
+		calls.push_back(1);
+		if (calls.size() == 2) { loop.quit(); }
+	}).has_value());
+	CHECK(loop.add_task_after_delay(std::chrono::milliseconds(-10), [&] {
+		calls.push_back(2);
+		if (calls.size() == 2) { loop.quit(); }
+	}).has_value());
+	CHECK(run_loop_with_timeout(loop));
+	CHECK((calls == std::vector<int>{1, 2}));
+}
+
+void test_throwing_callback_does_not_discard_other_expired_tasks() {
+	EventLoop loop;
+	std::vector<int> calls;
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+	CHECK(loop.add_task_at(deadline, [&] {
+		calls.push_back(1);
+		throw std::runtime_error("intentional timer callback failure");
+	}).has_value());
+	CHECK(loop.add_task_at(deadline, [&] { calls.push_back(2); loop.quit(); }).has_value());
+	CHECK(run_loop_with_timeout(loop));
+	CHECK((calls == std::vector<int>{1, 2}));
+}
+
+void test_throwing_repeat_callback_can_run_again_and_cancel() {
+	EventLoop loop;
+	int calls = 0;
+	std::optional<std::uint64_t> id;
+	id = loop.add_task_repeat_after_delay(std::chrono::milliseconds(0),
+		std::chrono::milliseconds(5), [&] {
+			if (++calls == 1) { throw std::runtime_error("intentional repeat callback failure"); }
+			if (calls == 3) { CHECK(loop.cancel(*id)); loop.quit(); }
+		});
+	CHECK(id.has_value());
+	CHECK(run_loop_with_timeout(loop));
+	CHECK(calls == 3);
+}
+
+void test_concurrent_timer_creation_has_unique_ids_and_owner_callbacks() {
+	EventLoop loop;
+	const auto owner = std::this_thread::get_id();
+	std::vector<std::vector<std::uint64_t>> ids(4);
+	std::vector<std::exception_ptr> errors(4);
+	std::vector<std::thread> producers;
+	int calls = 0;
+	for (int producer = 0; producer < 4; ++producer) {
+		producers.emplace_back([&, producer] {
+			try {
+				for (int item = 0; item < 8; ++item) {
+					auto id = loop.add_task_after_delay(std::chrono::milliseconds(0), [&] {
+						CHECK(std::this_thread::get_id() == owner);
+						if (++calls == 32) { loop.quit(); }
+					});
+					CHECK(id.has_value());
+					ids[producer].push_back(*id);
+				}
+			} catch (...) { errors[producer] = std::current_exception(); }
+		});
+	}
+	for (auto &producer : producers) { producer.join(); }
+	for (auto error : errors) { if (error) { std::rethrow_exception(error); } }
+	std::set<std::uint64_t> unique;
+	for (const auto &producer_ids : ids) {
+		for (auto id : producer_ids) { CHECK(unique.insert(id).second); }
+	}
+	CHECK(unique.size() == 32);
+	CHECK(run_loop_with_timeout(loop));
+	CHECK(calls == 32);
+}
+
 struct TestCase {
 	const char *name;
 	void (*run)();
@@ -173,6 +266,11 @@ int main() {
 		 test_repeat_timer_can_cancel_itself},
 		{"cross-thread add then cancel", test_cross_thread_add_then_cancel},
 		{"shutdown discards future timer", test_shutdown_discards_future_timer},
+		{"invalid intervals and post-quit requests are rejected", test_invalid_intervals_and_post_quit_requests_are_rejected},
+		{"past deadlines and negative delays run promptly", test_past_deadline_and_negative_delay_run_without_waiting_for_watchdog},
+		{"throwing callback preserves other expired tasks", test_throwing_callback_does_not_discard_other_expired_tasks},
+		{"throwing repeat callback can run again and cancel", test_throwing_repeat_callback_can_run_again_and_cancel},
+		{"concurrent timers have unique IDs and owner callbacks", test_concurrent_timer_creation_has_unique_ids_and_owner_callbacks},
 	};
 
 	std::size_t passed = 0;

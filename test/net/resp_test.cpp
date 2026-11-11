@@ -1,8 +1,10 @@
 #include "resp.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -485,6 +487,93 @@ void test_append_rejection_preserves_buffer() {
 	CHECK(result._result_value._bulk_string == "hello");
 }
 
+void check_value_equal(const Resp::RespValue &actual, const Resp::RespValue &expected) {
+	CHECK(actual._value_type == expected._value_type);
+	switch (expected._value_type) {
+		case Resp::RespValueType::SimpleString: CHECK(actual._simple_string == expected._simple_string); break;
+		case Resp::RespValueType::Error: CHECK(actual._errors == expected._errors); break;
+		case Resp::RespValueType::Integer: CHECK(actual._integer == expected._integer); break;
+		case Resp::RespValueType::BulkString: CHECK(actual._bulk_string == expected._bulk_string); break;
+		case Resp::RespValueType::Arrays:
+			CHECK(actual._array.size() == expected._array.size());
+			for (std::size_t index = 0; index < expected._array.size(); ++index) {
+				check_value_equal(actual._array[index], expected._array[index]);
+			}
+			break;
+	}
+}
+
+void test_nested_binary_frame_at_every_split_boundary() {
+	const std::string binary("A\0B\r\nC\xff", 7);
+	const std::string frame = "*4\r\n$7\r\n" + binary +
+		"\r\n+OK\r\n:-9223372036854775808\r\n*2\r\n-ERR nested\r\n*0\r\n";
+	const auto expected = Resp::RespValue::Array({
+		Resp::RespValue::BulkString(binary), Resp::RespValue::SimpleString("OK"),
+		Resp::RespValue::Integer(std::numeric_limits<std::int64_t>::min()),
+		Resp::RespValue::Array({Resp::RespValue::Errors("ERR nested"), Resp::RespValue::Array({})})
+	});
+	for (std::size_t split = 0; split <= frame.size(); ++split) {
+		Resp resp;
+		CHECK(resp.append(frame.substr(0, split)));
+		auto result = resp.decode();
+		if (split < frame.size()) {
+			CHECK(result._state == Resp::DecodeState::NeedMore);
+			CHECK(resp.decode()._state == Resp::DecodeState::NeedMore);
+			CHECK(resp.append(frame.substr(split)));
+			result = resp.decode();
+		}
+		CHECK(result._state == Resp::DecodeState::Complete);
+		check_value_equal(result._result_value, expected);
+		CHECK(resp.decode()._state == Resp::DecodeState::NeedMore);
+	}
+}
+
+void test_mixed_pipeline_with_changing_chunk_sizes() {
+	const std::string binary("\0x\r\n\xff", 5);
+	const std::string wire = "+\r\n-ERR\r\n:-9223372036854775808\r\n$5\r\n" + binary +
+		"\r\n*2\r\n$0\r\n\r\n:9223372036854775807\r\n";
+	const std::vector<Resp::RespValue> expected{
+		Resp::RespValue::SimpleString(""), Resp::RespValue::Errors("ERR"),
+		Resp::RespValue::Integer(std::numeric_limits<std::int64_t>::min()),
+		Resp::RespValue::BulkString(binary),
+		Resp::RespValue::Array({Resp::RespValue::BulkString(""),
+			Resp::RespValue::Integer(std::numeric_limits<std::int64_t>::max())})
+	};
+	Resp resp;
+	std::size_t offset = 0, received = 0;
+	while (offset < wire.size()) {
+		const std::size_t amount = std::min<std::size_t>(1 + offset % 13, wire.size() - offset);
+		CHECK(resp.append(wire.substr(offset, amount)));
+		offset += amount;
+		for (;;) {
+			auto result = resp.decode();
+			if (result._state == Resp::DecodeState::NeedMore) { break; }
+			CHECK(result._state == Resp::DecodeState::Complete && received < expected.size());
+			check_value_equal(result._result_value, expected[received++]);
+		}
+	}
+	CHECK(received == expected.size());
+	CHECK(resp.decode()._state == Resp::DecodeState::NeedMore);
+}
+
+void test_numeric_header_overflow_and_invalid_terminators_are_sticky_errors() {
+	const std::vector<std::string> malformed{
+		"*-\r\n", "*+1\r\n", "*2147483648\r\n", "*999999999999999999999\r\n",
+		"$-\r\n", "$2147483648\r\n", "$999999999999999999999\r\n",
+		":-9223372036854775809\r\n", "$3\r\nabcXX"
+	};
+	for (const auto &bad : malformed) {
+		for (const auto &prefix : {std::string(), std::string("*1\r\n")}) {
+			Resp resp;
+			CHECK(resp.append("+OK\r\n" + prefix + bad));
+			CHECK(resp.decode()._state == Resp::DecodeState::Complete);
+			CHECK(resp.decode()._state == Resp::DecodeState::Error);
+			CHECK(resp.append("+NEXT\r\n"));
+			CHECK(resp.decode()._state == Resp::DecodeState::Error);
+		}
+	}
+}
+
 // ─── test runner ────────────────────────────────────────────────
 
 struct TestCase {
@@ -534,6 +623,9 @@ int main() {
 		{"append limits", test_append_limits},
 		{"bulk parameter limit", test_bulk_parameter_limit},
 		{"append rejection preserves buffer", test_append_rejection_preserves_buffer},
+		{"nested binary frame at every split boundary", test_nested_binary_frame_at_every_split_boundary},
+		{"mixed pipeline with changing chunk sizes", test_mixed_pipeline_with_changing_chunk_sizes},
+		{"numeric header overflow and terminator errors stay sticky", test_numeric_header_overflow_and_invalid_terminators_are_sticky_errors},
 	};
 
 	std::size_t passed = 0;

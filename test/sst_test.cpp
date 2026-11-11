@@ -3,7 +3,9 @@
 #include "Record.h"
 #include "sst.h"
 #include "binary_test_helpers.h"
+#include "io/FileSystem.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -345,9 +347,12 @@ void test_read_block_rejects_metadata_region() {
 	// Seed the public constructor so the referenced bytes form a CRC-valid
 	// block, but its end crosses the declared metadata boundary by one byte.
 	// Without that boundary check, CRC validation alone accepts this block.
-	SST malformed(FileObj::open_read(fixture.path), metas, block_end - 1, 1, key, key);
+	const atlas::io::OpenOptions read_options{};
+	SST malformed(atlas::io::FileSystem::open(fixture.path, read_options),
+				  metas, block_end - 1, 1, key, key);
 	CHECK(malformed.read_block(0) == nullptr);
-	SST control(FileObj::open_read(fixture.path), metas, block_end, 1, key, key);
+	SST control(atlas::io::FileSystem::open(fixture.path, read_options),
+				metas, block_end, 1, key, key);
 	auto block = control.read_block(0);
 	CHECK(block != nullptr);
 	CHECK(*block->begin() == std::make_pair(key, std::string("value")));
@@ -649,6 +654,120 @@ void test_end_sentinel_stable() {
 	rm_tmp(path);
 }
 
+// Every entry has its own block, so damage and snapshot filtering can be
+// varied independently of the SSTBuilder's current block-size threshold.
+std::vector<std::uint8_t> independent_block_fixture(
+	const std::vector<std::pair<std::string, std::uint64_t>> &entries,
+	const std::vector<std::size_t> &damaged_blocks) {
+	std::vector<std::uint8_t> data;
+	std::vector<BlockMeta> metas;
+	for (std::size_t i = 0; i < entries.size(); ++i) {
+		const auto &[key, seq] = entries[i];
+		const auto encoded = enc(key, seq);
+		Block block;
+		CHECK(block.add_entry(encoded, "value-" + key, true));
+		auto bytes = block.encode(true);
+		if (std::find(damaged_blocks.begin(), damaged_blocks.end(), i) != damaged_blocks.end()) {
+			bytes.back() ^= 1; // preserve metadata and lengths, invalidate only this block CRC
+		}
+		metas.emplace_back(data.size(), encoded, encoded);
+		data.insert(data.end(), bytes.begin(), bytes.end());
+	}
+	return sst_fixture_bytes(data, metas);
+}
+
+void test_iterator_skips_damaged_middle_blocks_preserving_snapshot() {
+	ScopedSstFixture fixture;
+	fixture.write(independent_block_fixture({{"a", 10}, {"b", 10},
+		{"c", 30}, {"d", 10}}, {1}));
+	auto sst = SST::open(fixture.path, 1);
+	CHECK(sst != nullptr && sst->num_blocks() == 4);
+	CHECK(sst->read_block(1) == nullptr);
+	CHECK(!sst->get(enc("b", 20)).has_value());
+	for (bool keep_all : {false, true}) {
+		std::vector<std::string> keys;
+		auto iterator = sst->begin(20, keep_all);
+		while (iterator.is_valid()) {
+			CHECK(keys.size() < 4);
+			const auto key = InternalKey::decode((*iterator).first);
+			CHECK(key._commit_sequence <= 20);
+			keys.push_back(key._key);
+			++iterator;
+		}
+		CHECK((keys == std::vector<std::string>{"a", "d"}));
+		CHECK(iterator == sst->end());
+	}
+}
+
+void test_corrupt_first_or_last_block_produces_stable_end() {
+	for (const auto &damaged : {std::vector<std::size_t>{0},
+		std::vector<std::size_t>{2}, std::vector<std::size_t>{0, 1, 2}}) {
+		ScopedSstFixture fixture;
+		fixture.write(independent_block_fixture({{"a", 10}, {"b", 10}, {"c", 10}}, damaged));
+		auto sst = SST::open(fixture.path, 1);
+		CHECK(sst != nullptr);
+		auto iterator = sst->begin(20, false);
+		std::size_t rows = 0;
+		while (iterator.is_valid()) { CHECK(++rows <= 3); ++iterator; }
+		// A bad first block currently stops begin(); a bad trailing block is
+		// skipped during ++. Both routes must yield the same table's end sentinel.
+		CHECK(rows == (damaged.front() == 0 ? 0 : 2));
+		CHECK(iterator == sst->end());
+		++iterator; CHECK(iterator == sst->end());
+		bool threw = false;
+		try { (void)*iterator; } catch (const std::runtime_error &) { threw = true; }
+		CHECK(threw);
+	}
+}
+
+void test_predicate_skips_corrupt_blocks_and_keeps_snapshot_filter() {
+	for (const auto &damaged : {std::vector<std::size_t>{0},
+		std::vector<std::size_t>{1}, std::vector<std::size_t>{3},
+		std::vector<std::size_t>{0, 1, 2, 3}}) {
+		ScopedSstFixture fixture;
+		fixture.write(independent_block_fixture({{"a", 10}, {"b", 30}, {"c", 10}, {"d", 30}}, damaged));
+		auto sst = SST::open(fixture.path, 1); CHECK(sst != nullptr);
+		auto range = sst->iter_monotony_predicate([](const std::string &) { return 0; }, 20);
+		std::vector<std::string> keys;
+		if (range) {
+			for (auto iterator = range->first; iterator != range->second; ++iterator) {
+				CHECK(iterator.is_valid() && keys.size() < 4);
+				const auto key = InternalKey::decode((*iterator).first);
+				if (key._commit_sequence > 20) {
+					throw TestFailure("corrupt block " + std::to_string(damaged.front()) +
+						": snapshot 20 returned " + key._key + "@" +
+						std::to_string(key._commit_sequence));
+				}
+				keys.push_back(key._key);
+			}
+		}
+		std::vector<std::string> expected;
+		if (std::find(damaged.begin(), damaged.end(), 0) == damaged.end()) { expected.push_back("a"); }
+		if (std::find(damaged.begin(), damaged.end(), 2) == damaged.end()) { expected.push_back("c"); }
+		CHECK(keys == expected);
+	}
+}
+
+void test_predicate_preserves_snapshot_after_fully_filtered_start_block() {
+	ScopedSstFixture fixture;
+	fixture.write(independent_block_fixture({{"a", 30}, {"b", 10},
+		{"c", 30}, {"d", 10}}, {}));
+	auto sst = SST::open(fixture.path, 1); CHECK(sst != nullptr);
+	const auto range = sst->iter_monotony_predicate([](const std::string &) { return 0; }, 20);
+	CHECK(range.has_value());
+	std::vector<std::string> keys;
+	for (auto iterator = range->first; iterator != range->second; ++iterator) {
+		CHECK(iterator.is_valid() && keys.size() < 4);
+		const auto key = InternalKey::decode((*iterator).first);
+		if (key._commit_sequence > 20) {
+			throw TestFailure("all blocks intact: snapshot 20 returned " + key._key +
+				"@" + std::to_string(key._commit_sequence) + " after filtering a@30");
+		}
+		keys.push_back(key._key);
+	}
+	CHECK((keys == std::vector<std::string>{"b", "d"}));
+}
+
 // ─── test runner ────────────────────────────────────────────────
 
 struct TestCase {
@@ -709,6 +828,10 @@ int main() {
 		{"iterate skip filtered block", test_iterate_skip_filtered_block},
 		{"begin skips filtered leading blocks", test_begin_skips_filtered_leading_blocks},
 		{"end sentinel stable", test_end_sentinel_stable},
+		{"skip damaged middle blocks preserving snapshot", test_iterator_skips_damaged_middle_blocks_preserving_snapshot},
+		{"corrupt edge blocks produce stable end", test_corrupt_first_or_last_block_produces_stable_end},
+		{"predicate skips corrupt blocks preserving snapshot", test_predicate_skips_corrupt_blocks_and_keeps_snapshot_filter},
+		{"predicate preserves snapshot after filtered start block", test_predicate_preserves_snapshot_after_fully_filtered_start_block},
 	};
 	return run_tests(tests);
 }

@@ -1,4 +1,5 @@
 #include "lsm.h"
+#include "TranContext.h"
 #include "Record.h"
 
 #include <cstdint>
@@ -268,6 +269,64 @@ void test_watermark_across_instances() {
 	std::filesystem::remove_all(dir);
 }
 
+void test_batch_facade_normalizes_tombstones_and_preserves_duplicates() {
+	const std::string dir = "/tmp/facade_test_batch_visibility";
+	std::filesystem::remove_all(dir);
+	const std::string binary("a\0b", 3);
+	const std::vector<std::string> keys{"live", "empty", "gone", "missing", "live", binary};
+	auto verify = [&](LSM &db) {
+		const auto results = db.get_batch(keys);
+		CHECK(results.size() == keys.size());
+		for (std::size_t index = 0; index < keys.size(); ++index) {
+			const auto single = db.get(keys[index]);
+			CHECK(results[index]._value_type == single._value_type);
+			CHECK(results[index]._value == single._value);
+			CHECK(results[index]._value_type != TombStone);
+		}
+		CHECK(results[0]._value == "value" && results[4]._value == "value");
+		CHECK(results[1]._value_type == Value && results[1]._value.empty());
+		CHECK(results[2]._value_type == NotFound && results[3]._value_type == NotFound);
+		CHECK(results[5]._value == std::string("v\0x", 3));
+		CHECK(db.get_batch({}).empty());
+	};
+	{
+		LSM db(dir);
+		CHECK(db.put("live", "value").has_value());
+		CHECK(db.put("empty", "").has_value());
+		CHECK(db.put("gone", "old").has_value());
+		CHECK(db.put(binary, std::string("v\0x", 3)).has_value());
+		db.flush();
+		CHECK(db.remove("gone").has_value());
+		verify(db);
+		db.close();
+	}
+	{
+		LSM reopened(dir);
+		verify(reopened);
+	}
+	std::filesystem::remove_all(dir);
+}
+
+void test_transaction_facade_and_public_limits() {
+	const std::string dir = "/tmp/facade_test_transaction_entry";
+	std::filesystem::remove_all(dir);
+	{
+		LSM db(dir);
+		CHECK(db.get_max_key_size() == 65527);
+		CHECK(db.get_max_value_size() == 65535);
+		auto initial = db.begin_transaction(IsolationLevel::ReadCommited);
+		CHECK(initial->put("k", "old"));
+		CHECK(initial->commit().status == CommitResult::Status::Committed);
+		auto snapshot = db.begin_transaction(IsolationLevel::ReadRepeated);
+		CHECK(db.put("k", "new").has_value());
+		CHECK(snapshot->get("k") == "old");
+		CHECK(snapshot->put("k", "conflict"));
+		CHECK(snapshot->commit().status == CommitResult::Status::Conflict);
+		CHECK(db.get("k")._value == "new");
+	}
+	std::filesystem::remove_all(dir);
+}
+
 // ─── 测试注册 ───────────────────────────────────────────────────
 
 struct TestCase {
@@ -287,6 +346,8 @@ int main() {
 		{"close semantics", test_close_semantics},
 		{"flush and reopen", test_flush_and_reopen},
 		{"watermark across instances", test_watermark_across_instances},
+		{"batch facade handles tombstones, duplicates and binary data", test_batch_facade_normalizes_tombstones_and_preserves_duplicates},
+		{"transaction facade and public size limits", test_transaction_facade_and_public_limits},
 	};
 
 	std::size_t passed = 0;

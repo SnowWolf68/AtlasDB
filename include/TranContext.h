@@ -39,7 +39,7 @@ private:
 
 	std::shared_ptr<LSMEngine> _engine;
 	std::unordered_map<std::string, std::optional<std::string>> _map;
-	std::uint64_t _snapshot_seq;
+	std::uint64_t _snapshot_seq;	// 事务开始时, 当前全局的版本号到了多少
 	IsolationLevel _iso_level;
 	TranState _tran_state;
 };

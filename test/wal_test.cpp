@@ -1,5 +1,6 @@
 #include "lsm.h"
 #include "wal.h"
+#include "binary_test_helpers.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -31,6 +32,30 @@ int syncs = 0;
 std::string watched_directory;
 int directory_syncs = 0;
 bool fail_directory_sync = false;
+
+// Test-only durability model: each successful WAL fsync captures the bytes
+// that a simulated power loss is allowed to retain. The snapshot is a harness
+// artifact, not a claim about actual filesystem or device power-loss behavior.
+std::string modeled_wal;
+std::string durable_image;
+int modeled_syncs = 0;
+int suppress_modeled_sync = 0;
+
+void arm_durability_model(const std::string &wal_path,
+                          const std::string &image_path, int suppress_nth) {
+    modeled_wal = wal_path;
+    durable_image = image_path;
+    modeled_syncs = 0;
+    suppress_modeled_sync = suppress_nth;
+}
+
+bool is_modeled_wal(int fd) {
+    if (modeled_wal.empty()) return false;
+    char path[4096];
+    const auto link = "/proc/self/fd/" + std::to_string(fd);
+    const auto n = ::readlink(link.c_str(), path, sizeof(path));
+    return n > 0 && std::string(path, static_cast<std::size_t>(n)) == modeled_wal;
+}
 
 void arm_directory_sync(const std::string &dir, bool fail) {
     watched_directory = dir;
@@ -87,11 +112,15 @@ void reset() {
     watched_directory.clear();
     directory_syncs = 0;
     fail_directory_sync = false;
+    modeled_wal.clear();
+    durable_image.clear();
+    modeled_syncs = 0;
+    suppress_modeled_sync = 0;
 }
 } // namespace fault
-extern "C" ssize_t __real_write(int, const void *, size_t);
+extern "C" ssize_t __real_pwrite(int, const void *, size_t, off_t);
 extern "C" int __real_fsync(int);
-extern "C" ssize_t __wrap_write(int fd, const void *data, size_t size) {
+extern "C" ssize_t __wrap_pwrite(int fd, const void *data, size_t size, off_t offset) {
     if (fault::is_wal(fd)) {
         ++fault::writes;
         if ((fault::mode == fault::Mode::WriteError ||
@@ -101,7 +130,7 @@ extern "C" ssize_t __wrap_write(int fd, const void *data, size_t size) {
             const auto mode = fault::mode;
             fault::mode = fault::Mode::None; // following I/O could succeed
             if (mode == fault::Mode::ShortWrite)
-                return __real_write(fd, data, size / 2);
+                return __real_pwrite(fd, data, size / 2, offset);
             if (mode == fault::Mode::EintrRetry) {
                 errno = EINTR; // interrupted before writing anything: retryable
                 return -1;
@@ -112,7 +141,7 @@ extern "C" ssize_t __wrap_write(int fd, const void *data, size_t size) {
             return -1;
         }
     }
-    return __real_write(fd, data, size);
+    return __real_pwrite(fd, data, size, offset);
 }
 extern "C" int __wrap_fsync(int fd) {
     if (fault::is_watched_directory(fd)) {
@@ -133,6 +162,24 @@ extern "C" int __wrap_fsync(int fd) {
             errno = EIO;
             return -1;
         }
+    }
+    if (fault::is_modeled_wal(fd)) {
+        ++fault::modeled_syncs;
+        if (fault::modeled_syncs == fault::suppress_modeled_sync) {
+            return 0; // Model a missing sync while the caller sees success.
+        }
+        const int result = __real_fsync(fd);
+        if (result != 0) return result;
+        std::error_code error;
+        std::filesystem::copy_file("/proc/self/fd/" + std::to_string(fd),
+                                   fault::durable_image,
+                                   std::filesystem::copy_options::overwrite_existing,
+                                   error);
+        if (error) {
+            errno = EIO;
+            return -1;
+        }
+        return 0;
     }
     return __real_fsync(fd);
 }
@@ -217,6 +264,55 @@ void write_without_close(const std::string &dir,
     }
     wait_child(pid);
 }
+
+#ifdef ATLASDB_WAL_FAULT_INJECTION
+void check_modeled_power_loss(bool suppress_second_sync) {
+    TempDir dir;
+    const auto wal_path = WAL::get_filepath(dir.path, 1);
+    const auto image_path = dir.path + "/durable-image";
+    const pid_t pid = ::fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        try {
+            LSMEngine db(dir.path, 1024 * 1024, 4096, 100);
+            fault::arm_durability_model(wal_path, image_path,
+                                        suppress_second_sync ? 2 : 0);
+            CHECK(db.put("before", "first") == 1);
+            CHECK(db.put("after", "second") == 2);
+            ::_exit(0); // Skip close/flush and preserve the volatile WAL image.
+        } catch (const std::exception &e) {
+            std::cerr << "child: " << e.what() << '\n';
+            ::_exit(1);
+        }
+    }
+    wait_child(pid);
+
+    // Both acknowledged records reached the OS-visible WAL before the crash.
+    const auto expected_size =
+        record("before", "first", 1, Value).size() +
+        record("after", "second", 2, Value).size();
+    CHECK(std::filesystem::file_size(wal_path) == expected_size);
+
+    // Model a power loss which discards every byte after the last successful
+    // fsync. Unsynced data may in reality survive; this is one allowed outcome.
+    if (std::filesystem::exists(image_path)) {
+        std::filesystem::copy_file(image_path, wal_path,
+                                   std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::remove(image_path);
+    } else {
+        std::filesystem::resize_file(wal_path, 0);
+    }
+
+    LSMEngine reopened(dir.path);
+    CHECK(reopened.get("before")._value == "first");
+    const auto after = reopened.get("after");
+    if (suppress_second_sync) {
+        CHECK(after._value_type == NotFound);
+    } else {
+        CHECK(after._value_type == Value && after._value == "second");
+    }
+}
+#endif
 
 void test_batch_results_and_versions() {
     TempDir dir;
@@ -378,10 +474,50 @@ void test_bad_final_crc_rejects_recovery() {
     try {
         LSMEngine db(dir.path);
     } catch (const std::runtime_error &e) {
-        CHECK(std::string(e.what()) == "crc check failed");
+        // Recovery errors identify the WAL; wording and errno suffix may vary.
+        CHECK(std::string(e.what()).find(WAL::get_filepath(dir.path, 1)) !=
+              std::string::npos);
         rejected = true;
     }
     CHECK(rejected);
+    const auto persisted = FileObj::open_read(WAL::get_filepath(dir.path, 1));
+    CHECK(persisted.read(0, persisted.size()) == bytes);
+}
+
+void test_complete_unknown_record_type_rejects_recovery() {
+    for (const std::uint8_t type : {std::uint8_t{0}, std::uint8_t{1}, std::uint8_t{255}}) {
+        TempDir dir;
+        const auto prefix = record("good", "prefix", 7);
+        auto damaged = record("invalid", "value", 100);
+        damaged.front() = type;
+        binary_test::refresh_crc(damaged);
+        auto bytes = prefix;
+        bytes.insert(bytes.end(), damaged.begin(), damaged.end());
+        write_segment(dir.path, 1, bytes);
+        bool rejected = false;
+        try { LSMEngine db(dir.path); }
+        catch (const std::runtime_error &error) {
+            CHECK(std::string(error.what()).find(WAL::get_filepath(dir.path, 1)) !=
+                  std::string::npos);
+            rejected = true;
+        }
+        CHECK(rejected);
+        // Opening a corrupt WAL must not silently rewrite it into a good prefix.
+        const auto persisted = FileObj::open_read(WAL::get_filepath(dir.path, 1));
+        CHECK(persisted.read(0, persisted.size()) == bytes);
+    }
+}
+
+void test_standalone_delete_removes_segment_and_reports_missing() {
+    TempDir dir;
+    WAL wal(dir.path, 1);
+    CHECK(wal.append(record("key", "value", 7)));
+    const auto path = WAL::get_filepath(dir.path, 1);
+    CHECK(std::filesystem::exists(path));
+    CHECK(wal.delete_());
+    CHECK(!std::filesystem::exists(path));
+    CHECK(!wal.delete_());
+    wal.close();
 }
 
 void test_watermarks() {
@@ -880,6 +1016,8 @@ void test_batch_failure(fault::Mode mode, bool deleting) {
         // from scratch or from the written prefix: the whole batch is
         // confirmed and the write path stays alive instead of latching.
         check_success(result, 3);
+        CHECK(fault::remaining == 0);
+        CHECK(fault::writes == 4 && fault::syncs == 3);
         const auto first = *result[0];
         const auto type = deleting ? TombStone : Value;
         const auto value = deleting ? "" : "v";
@@ -899,7 +1037,10 @@ void test_batch_failure(fault::Mode mode, bool deleting) {
         return;
     }
     CHECK(result.size() == 3 && result[0] && !result[1] && !result[2]);
-    CHECK(fault::writes == 2 && fault::syncs == 2);
+    // A failed append returns before syncing; a sync failure follows a
+    // completed append. Neither path may perform I/O for the third record.
+    const int expected_syncs = mode == fault::Mode::SyncError ? 2 : 1;
+    CHECK(fault::writes == 2 && fault::syncs == expected_syncs);
     const auto first = *result[0];
     const auto type = deleting ? TombStone : Value;
     const auto value = deleting ? "" : "v";
@@ -920,7 +1061,7 @@ void test_batch_failure(fault::Mode mode, bool deleting) {
     CHECK(!db.remove("a"));
     check_rejected(db.put_batch({{"later", "v"}, {"later2", "v"}}), 2);
     check_rejected(db.remove_batch({"a", "b"}), 2);
-    CHECK(fault::writes == 2 && fault::syncs == 2);
+    CHECK(fault::writes == 2 && fault::syncs == expected_syncs);
     fault::reset();
 }
 
@@ -1043,6 +1184,8 @@ int main() {
         {"every truncated final-record boundary", test_every_truncated_tail_boundary},
         {"large WAL reopens within default stack", test_large_wal_reopens_within_default_stack},
         {"bad final CRC rejects recovery", test_bad_final_crc_rejects_recovery},
+        {"complete unknown record type rejects recovery", test_complete_unknown_record_type_rejects_recovery},
+        {"standalone delete removes segment and reports missing", test_standalone_delete_removes_segment_and_reports_missing},
         {"missing/stale/ahead watermark and tombstone maximum", test_watermarks},
         {"put/remove generation results and clear IDs", test_memtable_generation_results_and_clear},
         {"freeze rotation open failure latches write error", test_freeze_rotation_open_failure_latches_error},
@@ -1058,6 +1201,8 @@ int main() {
         {"manifest corrupt sst rejects open", test_manifest_corrupt_sst_rejects_open},
         {"compact delete failure continues", test_compact_delete_failure_continues},
 #ifdef ATLASDB_WAL_FAULT_INJECTION
+        {"modeled power loss retains both synced WAL writes", [] { check_modeled_power_loss(false); }},
+        {"modeled power loss drops acknowledged unsynced WAL write", [] { check_modeled_power_loss(true); }},
         {"reopened WAL syncs directory before writes", [] { test_reopen_wal_directory_sync(false); }},
         {"reopened WAL directory sync failure rejects open", [] { test_reopen_wal_directory_sync(true); }},
         {"atomic publish crash leaves complete file", test_atomic_publish_crash_leaves_complete_file},

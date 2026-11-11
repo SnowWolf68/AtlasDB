@@ -513,7 +513,7 @@ void check_heap_entries(HeapIterator it,
 		CHECK(&(++it) == &it);
 	}
 	CHECK(!it.is_valid());
-	CHECK(it == HeapIterator(true));
+	CHECK(it == HeapIterator(true, false));
 	CHECK(&(++it) == &it);
 	CHECK(&(++it) == &it);
 	CHECK(!it.is_valid());
@@ -679,7 +679,7 @@ void test_begin_filters_before_first_observation() {
 void test_heap_empty_increment_and_dereference() {
 	for (bool keep_all : {false, true}) {
 		for (bool skip_tombstone : {false, true}) {
-			HeapIterator it(skip_tombstone, std::uint64_t{10}, keep_all);
+			HeapIterator it(skip_tombstone, keep_all, std::uint64_t{10});
 			check_heap_entries(it, {});
 			bool threw = false;
 			try { (void)*it; }
@@ -780,6 +780,102 @@ void test_heap_increment_tombstone_between_versions() {
 void test_get_total_size_empty() {
 	MemTable table;
 	CHECK(table.get_total_size() == 0);
+}
+
+void test_same_version_replacement_updates_byte_accounting() {
+	MemTable table;
+	CHECK(table.put("k", "12345", 10)._is_add);
+	CHECK(table.get_total_size() == 14);
+	CHECK(!table.put("k", "xy", 10)._is_add);
+	CHECK(table.get_total_size() == 11);
+	check_result_is_value(table.get("k", 10), "xy", 10);
+	CHECK(!table.put("k", "123456789", 10)._is_add);
+	CHECK(table.get_total_size() == 18);
+	auto it = table.begin(std::nullopt, true, false);
+	CHECK(it.is_valid());
+	CHECK((*it).second == "123456789");
+	++it;
+	CHECK(!it.is_valid());
+}
+
+void test_replacement_growth_can_freeze_without_adding_a_version() {
+	MemTable table(24);
+	CHECK(table.put("k", "a", 10)._is_add);
+	auto replaced = table.put("k", std::string(40, 'x'), 10);
+	CHECK(!replaced._is_add);
+	CHECK(replaced._frozen_list_id.has_value());
+	CHECK(replaced._new_active_list_id.has_value());
+	CHECK(table.get_total_size() == 49);
+	check_result_is_value(table.get("k", 10), std::string(40, 'x'), 10);
+	CHECK(table.put("z", "b", 11)._is_add);
+	CHECK(table.get_total_size() == 59);
+}
+
+void test_batch_replacement_counts_only_latest_payload() {
+	MemTable table;
+	CHECK(table.put_batch({{"k", "long-value"}, {"k", "x"}, {"k", "last"}}, {10, 10, 10}));
+	CHECK(table.get_total_size() == 13);
+	check_result_is_value(table.get("k", 10), "last", 10);
+	auto it = table.begin(std::nullopt, true, false);
+	CHECK(it.is_valid());
+	++it;
+	CHECK(!it.is_valid());
+}
+
+void test_repeated_tombstone_does_not_double_count() {
+	MemTable table;
+	CHECK(table.remove("gone", 10)._is_success);
+	const auto size = table.get_total_size();
+	CHECK(!table.remove("gone", 10)._is_success);
+	CHECK(table.get_total_size() == size && size == 12);
+	CHECK(table.get("gone", 10)._value_type == TombStone);
+}
+
+void test_encoded_entry_ingestion_freezes_and_preserves_snapshots() {
+	MemTable table(20);
+	const auto old = InternalKey::encode(InternalKey("k", 1, Value));
+	const auto deleted = InternalKey::encode(InternalKey("k", 2, TombStone));
+	const auto latest = InternalKey::encode(InternalKey("z", 3, Value));
+	table.put_entry_data(old, "old");
+	table.put_entry_data(deleted, "");
+	table.put_entry_data(latest, "new");
+	CHECK(table.get_total_size() == 33);
+	check_result_is_value(table.get("k", 1), "old", 1);
+	CHECK(table.get("k", 2)._value_type == TombStone);
+	check_result_is_notfound(table.get("z", 2));
+	check_result_is_value(table.get("z", 3), "new", 3);
+	std::size_t count = 0;
+	for (auto it = table.begin(std::nullopt, true, false); it.is_valid(); ++it) { ++count; }
+	CHECK(count == 3);
+}
+
+void test_binary_prefix_carry_across_frozen_and_active() {
+	MemTable table;
+	const std::string high(1, static_cast<char>(0xff));
+	const std::string carry = "ab" + high;
+	const std::vector<std::string> keys = {
+		"aa", carry, carry + std::string(1, '\0'), "ac", high, high + "x"
+	};
+	for (const auto &key : keys) { CHECK(table.put(key, "old", 1)._is_add); }
+	table.froze();
+	CHECK(table.put(carry, "new", 2)._is_add);
+	CHECK(table.remove(high + "x", 3)._is_success);
+	for (const auto &prefix : {carry, high}) {
+		for (std::uint64_t snapshot : {1, 3}) {
+			std::vector<std::pair<std::string, std::string>> expected;
+			for (const auto &key : keys) {
+				if (key.compare(0, prefix.size(), prefix) != 0) { continue; }
+				if (snapshot == 3 && key == high + "x") { continue; }
+				expected.push_back({key, snapshot == 3 && key == carry ? "new" : "old"});
+			}
+			std::vector<std::pair<std::string, std::string>> actual;
+			for (auto it = table.begin_preffix(prefix, snapshot); it.is_valid(); ++it) {
+				const auto item = *it;
+				actual.push_back({InternalKey::decode(item.first)._key, item.second});
+			}
+			CHECK(actual == expected);
+		}
+	}
 }
 
 void test_get_total_size_tracks_puts_and_remove() {
@@ -896,6 +992,12 @@ struct TestCase {
 
 int main() {
 	const TestCase tests[] = {
+		{"same version replacement updates byte accounting", test_same_version_replacement_updates_byte_accounting},
+		{"replacement growth freezes without adding a version", test_replacement_growth_can_freeze_without_adding_a_version},
+		{"batch replacement counts only latest payload", test_batch_replacement_counts_only_latest_payload},
+		{"repeated tombstone does not double count", test_repeated_tombstone_does_not_double_count},
+		{"encoded entry ingestion freezes and preserves snapshots", test_encoded_entry_ingestion_freezes_and_preserves_snapshots},
+		{"binary prefix carry across active and frozen", test_binary_prefix_carry_across_frozen_and_active},
 		{"empty memtable get", test_empty_memtable_get},
 		{"put and get", test_put_and_get},
 		{"put multiple keys", test_put_multiple_keys},
